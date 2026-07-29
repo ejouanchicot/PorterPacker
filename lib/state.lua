@@ -22,6 +22,9 @@ local M = {}
 M.packet_state         = 0      -- 0/1/2/3 (see header)
 M.last_update          = nil    -- last 0x05C menu update packet
 M.last_trade_confirmed = false  -- true when 0x052 close arrived (vs force-reset)
+-- Set when a store menu is patched: the client, not us, sends the 0x5B that
+-- closes it, and that close would otherwise look like the player interfering.
+M.expecting_client_close = false
 
 -- ---------------------------------------------------------------------------
 -- Operation flags
@@ -71,6 +74,7 @@ function M.reset_all()
     M.packet_state         = 0
     M.last_update          = nil
     M.last_trade_confirmed = false
+    M.expecting_client_close = false
     M.storing_items        = false
     M.continuous           = false
     M.retrieve          = {}

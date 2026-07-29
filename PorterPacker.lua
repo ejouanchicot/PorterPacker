@@ -365,6 +365,10 @@ end
 ---        the upcoming unpack phase will need anyway (otherwise we'd pack
 ---        Naegling under WAR.lua then immediately re-unpack it under THF
 ---        because Naegling appears in nearly every job's pack list).
+-- Pause between two jobs that traded, on top of waiting for the state machine
+-- to go idle. Covers packets the client has queued but not yet put on the wire.
+local INTER_JOB_SETTLE = 2.0
+
 local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclude_ids)
     local skip_upper = skip_job and skip_job:upper() or nil
     local action_label = is_pack and 'PACK ALL' or 'UNPACK ALL'
@@ -431,6 +435,9 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
     end
 
     -- Counters
+    -- Whether the job before this one put anything on the wire, which decides
+    -- if the next one has to wait for it to settle.
+    local previous_job_traded = false
     local total_done = 0 -- jobs that actually performed trades
     local total_skipped = 0 -- jobs skipped (no items / no file)
     local total_aborted = 0 -- jobs aborted (network deadlock)
@@ -450,6 +457,7 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
             if not item_ids then
                 -- No data file -> skip
                 total_skipped = total_skipped + 1
+                previous_job_traded = false
                 Debug.log(('SKIP %s: no data file'):format(job))
             else
                 -- Swap-mode optimization: exclude items that the upcoming
@@ -475,19 +483,31 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
                 local in_bag_count = is_pack and count_items_in_bags(item_ids) or nil
                 if is_pack and in_bag_count == 0 then
                     total_skipped = total_skipped + 1
+                    previous_job_traded = false
                     Debug.log(('SKIP %s: 0 items in bags (already packed)'):format(job))
                 else
-                    -- Wait for any in-flight packet from previous job to settle
+                    -- Let anything the previous job put on the wire settle.
+                    --
+                    -- The poll below is the real check; the flat pause after it
+                    -- is insurance against packets the client has queued but not
+                    -- sent. A job that never traded queued nothing, so it skips
+                    -- the pause entirely -- on a mostly-packed character that is
+                    -- the majority of the loop.
                     if job_idx > 1 then
                         local poll = 0
                         while State.packet_state ~= 0 and poll < 200 do
                             coroutine.sleep(0.025)
                             poll = poll + 1
                         end
-                        Debug.log(
-                            ('inter-job poll: %d cycles, state=%d, then 2s flat'):format(poll, State.packet_state)
-                        )
-                        coroutine.sleep(2.0)
+
+                        if previous_job_traded then
+                            Debug.log(('inter-job poll: %d cycles, state=%d, then %.1fs settle'):format(
+                                poll, State.packet_state, INTER_JOB_SETTLE))
+                            coroutine.sleep(INTER_JOB_SETTLE)
+                        else
+                            Debug.log(('inter-job poll: %d cycles, state=%d, previous job idle - no settle'):format(
+                                poll, State.packet_state))
+                        end
                     end
 
                     if State.packet_state ~= 0 then
@@ -558,6 +578,8 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
 
                     local job_attempts = State.async_trade_attempts
                     local job_successes = State.async_trade_successes
+                    -- Only a job that actually traded leaves packets in flight.
+                    previous_job_traded = job_attempts > 0
                     Debug.log(
                         ('<-- %s done (items=%d, slips=%d, attempts=%d, successes=%d, inv_free=%d, state=%d)'):format(
                             job,

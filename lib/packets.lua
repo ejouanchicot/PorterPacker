@@ -340,6 +340,12 @@ local function handle_store_menu(data)
         return false
     end
 
+    -- Storing never sends its own menu answer: we hand the patched packet back
+    -- and the client closes the dialog itself. Record that so the outgoing
+    -- handler recognises that close as ours rather than reporting it as the
+    -- player interfering.
+    State.expecting_client_close = true
+
     return data:sub(1, HEADER_LAST + 1)
         .. string.char(1, 0, 0, 0, 1)
         .. data:sub(GATE_AT + 2)
@@ -490,13 +496,23 @@ windower.register_event('incoming chunk', function(id, data)
 end)
 
 windower.register_event('outgoing chunk', function(id, data, modified, injected)
-    -- A menu answer we did not inject means the player clicked something while
-    -- an operation was running. Treat it as a close so we unwind cleanly.
-    if id == PACKET_MENU_ANSWER and State.packet_state ~= 0 and not injected then
-        Debug.log(('!! MANUAL 0x5B click during op (state=%d) - user touched UI'):format(
-            State.packet_state))
-        State.packet_state = 3
+    if id ~= PACKET_MENU_ANSWER or State.packet_state == 0 or injected then
+        return
     end
+
+    -- A menu answer we did not inject is either the client closing a store
+    -- dialog we patched -- the normal way packing finishes -- or the player
+    -- clicking mid-operation. Both need the state machine moved to "closing",
+    -- but only the second is worth warning about.
+    if State.expecting_client_close then
+        State.expecting_client_close = false
+        Debug.log('store menu closed by client (expected)')
+    else
+        Debug.log(('!! unexpected 0x5B during op (state=%d) - player touched the UI'):format(
+            State.packet_state))
+    end
+
+    State.packet_state = 3
 end)
 
 windower.register_event('incoming text', function(original, modified, mode)
