@@ -260,6 +260,23 @@ Packets.on_slip_finished = M.step_through_slips
 -- Bulk transfer
 -- ===========================================================================
 
+--- Spell out what a trade contained. Built only when one fails, since that is
+--- the only time the contents matter.
+---
+--- A timeout leaves the state machine at 1, meaning the porter never opened a
+--- menu -- it declined the whole trade rather than taking part of it. When that
+--- happens repeatedly for one slip while every other slip goes through first
+--- time, the likely reason is a single item in the batch the porter will not
+--- accept there, so the batch needs naming.
+local function describe_group(group)
+    local parts = {}
+    for index, item in ipairs(group) do
+        local record = res.items[item.id]
+        parts[index] = ('%s(%d)'):format(record and record.name or '?', item.id)
+    end
+    return table.concat(parts, ', ')
+end
+
 --- Trade one group and wait for the server. Returns whether it went through.
 local function trade_and_wait(npc, group, slip_num, item_count)
     Msg.progress('Packing', slip_num, item_count)
@@ -269,6 +286,8 @@ local function trade_and_wait(npc, group, slip_num, item_count)
     if State.packet_state == 0 then
         return true
     end
+
+    Debug.log(('!! slip %d REFUSED the batch: %s'):format(slip_num, describe_group(group)))
 
     State.packet_state = 0  -- clear the stuck state so the next trade can run
     return false
