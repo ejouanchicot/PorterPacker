@@ -1,0 +1,840 @@
+_addon.name = 'PorterPacker'
+_addon.author = 'ejouanchicot (refactor); orig. Ivaar, mods Gimlic & Siyual'
+_addon.version = '2.0.0'
+_addon.commands = {'porterpacker', 'packer', 'po'}
+
+---============================================================================
+--- PorterPacker - Main entry point
+---============================================================================
+--- Modular structure:
+---   lib/config.lua    - Constants (bags, zones, packlist)
+---   lib/state.lua     - Mutable shared state
+---   lib/debug.lua     - Logger
+---   lib/inventory.lua - Bag operations (gather/return/put_away/retrieve/find)
+---   lib/packets.lua   - Packet handlers + state machine + trade_npc
+---   lib/flow.lua      - porter_trade (single) + continuous_porter (bulk)
+---   messages.lua      - UI formatting
+---   data/             - Per-job item lists
+---
+--- This file owns:
+---   - Windower require/load directives
+---   - The addon command handler (`//po ...`)
+---   - The bulk packall/unpackall iteration logic
+---============================================================================
+
+require('pack')
+require('sets')
+require('logger')
+require('coroutine')
+bit = require('bit')
+slips = require('slips')
+res = require('resources')
+
+local Msg = require('messages')
+local Config = require('lib/config')
+local State = require('lib/state')
+local Debug = require('lib/debug')
+local Inv = require('lib/inventory')
+local Packets = require('lib/packets')
+local Flow = require('lib/flow')
+local SlipsLookup = require('lib/slips_lookup')
+
+---============================================================================
+--- File loader: turns a list of item NAMES into a set of item IDs.
+---
+--- Lookup priority (FIRST hit wins):
+---   1. data/<charname>/Active/<file>.lua    (job player actively plays)
+---   2. data/<charname>/Inactive/<file>.lua  (job stored only, not played)
+---   3. data/<charname>/<file>.lua           (legacy flat per-char layout)
+---   4. data/<file>.lua                       (legacy generic location)
+---
+--- Active/Inactive split lets //po unpackall target only active jobs by default.
+--- Per-character profile lets multiple characters share the addon while each
+--- has their own gear list (Player1/Active/COR.lua vs Player2/Active/COR.lua).
+---============================================================================
+
+-- Per-command cache: <file_name>|<mode> -> set of item_ids.
+-- Cleared at the top of every addon command (right after Config.refresh) so
+-- per-character config changes always take effect. Within a single command,
+-- the same (file, mode) pair is never re-scanned against res.items.
+--
+-- A //po swap previously re-scanned res.items ~17 times per swap
+-- (1 target unpack + 1 per job pack list + 1 target unpack again),
+-- each scan being a full iteration of ~30 000 items with two string.lower
+-- allocations per item. The cache eliminates the redundant scans.
+--
+-- IMPORTANT: load_file returns a *fresh copy* on cache hit, because callers
+-- mutate the result (assigned to State.retrieve which gets entries removed
+-- during unpack, or filtered in bulk_op via exclude_ids).
+local load_file_cache = {}
+
+-- Reverse lookup: lower-cased item name -> list of ids. Built once at addon
+-- load by scanning res.items (~30 000 entries). Without this, every load_file
+-- call iterated all of res.items and called string.lower twice per item to
+-- match a job's ~50-200 entries -- a 100-600x ratio of wasted work.
+--
+-- IMPORTANT: one name can map to multiple ids. Reforged armor (Maxixi/Horos/
+-- Macuele/Meg./Charis/etc.) ships with two ids per piece -- one for races=298
+-- (Hume/Elvaan/Tarutaru/Galka males) and one for races=212 (females + Mithra)
+-- -- and slip storage stores BOTH ids. If we kept only one id per name, the
+-- unpack set would miss the gender variant the player actually owns and those
+-- items would never come out of the slip. So map name -> array of ids and
+-- resolve every match in load_file.
+--
+-- Both .name and .name_log are indexed because data files use the display
+-- name ("Naegling") while res.items sometimes only matches via name_log.
+local items_by_lower_name = {}
+local function add_name_id(name, id)
+    if not name or name == '' then return end
+    local key = name:lower()
+    local list = items_by_lower_name[key]
+    if not list then
+        items_by_lower_name[key] = {id}
+        return
+    end
+    for _, existing in ipairs(list) do
+        if existing == id then return end
+    end
+    list[#list + 1] = id
+end
+do
+    local count = 0
+    for id, item in pairs(res.items) do
+        add_name_id(item.name_log, id)
+        add_name_id(item.name, id)
+        count = count + 1
+    end
+    -- Tiny sanity check so a corrupt resources table is loud, not silent.
+    if count == 0 then
+        windower.add_to_chat(167,
+            '[PorterPacker] WARNING: res.items returned 0 entries - name lookup table is empty.')
+    end
+end
+
+--- Load a job data file and return a set of FFXI item ids matching the names.
+---
+--- The data file's `return` value can be:
+---   1. A flat array of item-name strings (legacy format) — used for both
+---      pack and unpack indiscriminately.
+---   2. A split table `{ pack = {...}, unpack = {...} }` — pack uses the wider
+---      list (e.g. items the player owns even for jobs not played), unpack
+---      uses the narrower list (only items in the active char's set files).
+---
+--- @param file_name string  Job code or custom name (e.g. 'COR', 'Player1_THF')
+--- @param mode      string? 'pack' or 'unpack' (only used for split files);
+---                          defaults to 'pack' if absent.
+--- @return table set of item_ids matching the resolved list, or nil on error
+local function load_file(file_name, mode)
+    mode = mode or 'pack'
+
+    -- Cache hit: return a fresh copy (callers mutate the result)
+    local cache_key = file_name .. '|' .. mode
+    local cached = load_file_cache[cache_key]
+    if cached then
+        local copy = {}
+        for id in pairs(cached) do copy[id] = true end
+        return copy
+    end
+
+    local player = windower.ffxi.get_player()
+    local char_name = (player and player.name) or nil
+
+    -- Build lookup paths in priority order:
+    -- char/Active -> char/Inactive -> char root (legacy) -> data root (legacy)
+    local paths = {}
+    if char_name then
+        table.insert(
+            paths,
+            {
+                path = windower.addon_path .. '/data/' .. char_name .. '/Active/' .. file_name .. '.lua',
+                label = char_name .. '/Active/' .. file_name .. '.lua'
+            }
+        )
+        table.insert(
+            paths,
+            {
+                path = windower.addon_path .. '/data/' .. char_name .. '/Inactive/' .. file_name .. '.lua',
+                label = char_name .. '/Inactive/' .. file_name .. '.lua'
+            }
+        )
+        table.insert(
+            paths,
+            {
+                path = windower.addon_path .. '/data/' .. char_name .. '/' .. file_name .. '.lua',
+                label = char_name .. '/' .. file_name .. '.lua'
+            }
+        )
+    end
+    table.insert(
+        paths,
+        {
+            path = windower.addon_path .. '/data/' .. file_name .. '.lua',
+            label = file_name .. '.lua'
+        }
+    )
+
+    for _, p in ipairs(paths) do
+        if windower.file_exists(p.path) then
+            local item_table = dofile(p.path)
+            -- Detect split format: presence of .pack or .unpack keys.
+            local is_split =
+                type(item_table) == 'table' and (type(item_table.pack) == 'table' or type(item_table.unpack) == 'table')
+            local names_list
+            if is_split then
+                names_list = item_table[mode] or item_table.pack or item_table.unpack
+            else
+                names_list = item_table -- legacy flat list
+            end
+
+            -- Resolve names -> ids via the precomputed reverse lookup table
+            -- (built once at addon load). One hash lookup per data-file entry
+            -- instead of one full pass over res.items per call. Each name may
+            -- map to multiple ids (gender variants for reforged armor) -- add
+            -- them all so the unpack set covers whichever id the slip stored.
+            local item_ids = {}
+            for _, name in pairs(names_list) do
+                if type(name) == 'string' then
+                    local ids = items_by_lower_name[name:lower()]
+                    if ids then
+                        for _, id in ipairs(ids) do
+                            item_ids[id] = true
+                        end
+                    end
+                end
+            end
+            if table.length(item_ids) ~= 0 then
+                local label = p.label
+                if is_split then
+                    label = label .. ' [' .. mode .. ']'
+                end
+                Msg.file_loaded(label)
+                -- Cache the canonical set, then hand the caller its own copy
+                -- so subsequent mutations (State.retrieve removals, exclude
+                -- filtering) don't corrupt the cached entry.
+                load_file_cache[cache_key] = item_ids
+                local copy = {}
+                for id in pairs(item_ids) do copy[id] = true end
+                return copy
+            end
+            Msg.error(('Unable to load items from %s'):format(p.label))
+            return nil
+        end
+    end
+
+    -- Build a friendly error message listing the paths tried
+    local tried = {}
+    for _, p in ipairs(paths) do
+        table.insert(tried, p.label)
+    end
+    Msg.error('No matching data file found. Tried: ' .. table.concat(tried, ', '))
+    return nil
+end
+
+---============================================================================
+--- Bulk packall / unpackall logic
+---============================================================================
+
+---============================================================================
+--- Count items in equippable_bags whose id is in `item_ids` (set).
+--- Used by bulk_op to skip jobs that have nothing to pack.
+---============================================================================
+local function count_items_in_bags(item_ids)
+    local count = 0
+    for _, bag_id in ipairs(Config.equippable_bags) do
+        local bag = windower.ffxi.get_items(bag_id)
+        if bag then
+            for _, it in ipairs(bag) do
+                if it.id and it.id > 0 and it.status == 0 and item_ids[it.id] then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+---============================================================================
+--- Bulk operation: iterate the active char's job list, packing or unpacking.
+---============================================================================
+--- @param is_pack    boolean  true = pack everything, false = unpack everything
+--- @param player     table    windower.ffxi.get_player()
+--- @param skip_job  string?  optional job code to exclude from the iteration
+---                           (e.g. 'PLD' to pack everything except PLD)
+--- @param mode      string?  'active'   = only jobs in data/<char>/Active/
+---                           'inactive' = only jobs in data/<char>/Inactive/
+---                           nil        = every job (Active + Inactive)
+--- @param defer_slip_return boolean? if true, slips stay in inv at the end
+---        (caller is responsible for the final return). Used by swap mode so
+---        the unpack phase can reuse the slips already in inv.
+--- @param exclude_ids table? set of item_ids to remove from each job's pack
+---        list before packing. Used by swap mode to keep items in inv that
+---        the upcoming unpack phase will need anyway (otherwise we'd pack
+---        Naegling under WAR.lua then immediately re-unpack it under THF
+---        because Naegling appears in nearly every job's pack list).
+local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclude_ids)
+    local skip_upper = skip_job and skip_job:upper() or nil
+    local action_label = is_pack and 'PACK ALL' or 'UNPACK ALL'
+    if mode == 'active' then
+        action_label = action_label .. ' (ACTIVE)'
+    end
+    if mode == 'inactive' then
+        action_label = action_label .. ' (INACTIVE)'
+    end
+
+    -- Discover jobs from data/<charname>/{Active,Inactive}/ (filtered by
+    -- player.jobs[JOB] >= Config.MIN_JOB_LEVEL).
+    local jobs_list
+    if mode == 'active' then
+        jobs_list = Config.get_active_jobs_packlist()
+    elseif mode == 'inactive' then
+        jobs_list = Config.get_inactive_jobs_packlist()
+    else
+        jobs_list = Config.get_jobs_packlist()
+    end
+    if #jobs_list == 0 then
+        local cname = (player and player.name) or '?'
+        if mode == 'active' then
+            Msg.error(('No Active jobs found - put files in data/%s/Active/<JOB>.lua.'):format(cname))
+            return
+        end
+        if mode == 'inactive' then
+            Msg.error(('No Inactive jobs found - put files in data/%s/Inactive/<JOB>.lua.'):format(cname))
+            return
+        end
+        Msg.error(
+            ('No data files found in data/%s/Active/ or /Inactive/ - create some first (or use //po export to bootstrap).'):format(
+                cname
+            )
+        )
+        return
+    end
+
+    local target_count = #jobs_list
+    if skip_upper then
+        target_count = target_count - 1
+    end
+
+    Msg.bulk_start(action_label, nil, target_count, skip_upper)
+    Debug.log(
+        ('===== BULK %s START - %s%s ====='):format(
+            action_label,
+            table.concat(jobs_list, ','),
+            skip_upper and (' [SKIP ' .. skip_upper .. ']') or ''
+        )
+    )
+
+    -- Pre-gather slips once
+    local gathered, needed, pending = Inv.gather_slips_from_home()
+    if needed and needed > 0 then
+        Msg.error(
+            ('Inventory full: need %d more free slot(s) to gather all storage slips ' ..
+                '(%d still pending). Make space and retry.'):format(needed, pending - gathered)
+        )
+        Debug.log(('ABORT: inv full, missing %d slots, %d slips ungathered'):format(needed, pending - gathered))
+        return
+    end
+    if gathered > 0 then
+        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
+        Debug.log(('gathered %d slips - 2s settle'):format(gathered))
+        coroutine.sleep(2.0)
+    end
+
+    -- Counters
+    local total_done = 0 -- jobs that actually performed trades
+    local total_skipped = 0 -- jobs skipped (no items / no file)
+    local total_aborted = 0 -- jobs aborted (network deadlock)
+    local total_items = 0
+    local total_slips = 0
+    local stalled_jobs = 0
+
+    for job_idx, job in ipairs(jobs_list) do
+        -- Caller-requested skip (target of an unpack)
+        if skip_upper and job:upper() == skip_upper then
+            Debug.log(('SKIP job %s (excluded by caller: target of unpack)'):format(job))
+        else
+            Debug.log(('---------- JOB %d/%d: %s ----------'):format(job_idx, #jobs_list, job))
+            -- For split-format files, pack uses the wide list, unpack the narrow one.
+            local item_ids = load_file(job, is_pack and 'pack' or 'unpack')
+
+            if not item_ids then
+                -- No data file -> skip
+                total_skipped = total_skipped + 1
+                Debug.log(('SKIP %s: no data file'):format(job))
+            else
+                -- Swap-mode optimization: exclude items that the upcoming
+                -- unpack phase will need. Removing them from THIS job's pack
+                -- set means they stay in inv instead of doing a pack+unpack
+                -- round-trip through the Porter (saves trades for shared gear
+                -- like Naegling/Sibyl Scarf that appear in every job's pack).
+                if is_pack and exclude_ids then
+                    local removed = 0
+                    for id in pairs(exclude_ids) do
+                        if item_ids[id] then
+                            item_ids[id] = nil
+                            removed = removed + 1
+                        end
+                    end
+                    if removed > 0 then
+                        Debug.log(('  %s pack list: excluded %d item(s) destined for unpack'):format(job, removed))
+                    end
+                end
+
+                -- Skip-if-empty optimization: for PACK ops, scan bags and count
+                -- how many items the job has currently. If 0, skip (already packed).
+                local in_bag_count = is_pack and count_items_in_bags(item_ids) or nil
+                if is_pack and in_bag_count == 0 then
+                    total_skipped = total_skipped + 1
+                    Debug.log(('SKIP %s: 0 items in bags (already packed)'):format(job))
+                else
+                    -- Wait for any in-flight packet from previous job to settle
+                    if job_idx > 1 then
+                        local poll = 0
+                        while State.packet_state ~= 0 and poll < 200 do
+                            coroutine.sleep(0.025)
+                            poll = poll + 1
+                        end
+                        Debug.log(
+                            ('inter-job poll: %d cycles, state=%d, then 2s flat'):format(poll, State.packet_state)
+                        )
+                        coroutine.sleep(2.0)
+                    end
+
+                    if State.packet_state ~= 0 then
+                        Msg.warning(
+                            ('State stuck (state=%d) before job %s - forcing reset'):format(State.packet_state, job)
+                        )
+                        Debug.log(('FORCE RESET state from %d to 0 before %s'):format(State.packet_state, job))
+                        State.packet_state = 0
+                        State.last_update = nil
+                        coroutine.sleep(1.0)
+                    end
+
+                    -- Re-gather any missing slips. Idempotent: skips slips already in inv.
+                    if job_idx > 1 then
+                        local re_gathered, re_needed = Inv.gather_slips_from_home()
+                        if re_needed and re_needed > 0 then
+                            Msg.warning(
+                                ('Could not gather all slips before %s: need %d more inv slot(s)'):format(
+                                    job,
+                                    re_needed
+                                )
+                            )
+                            Debug.log(('!! re-gather inv full: missing %d slots before %s'):format(re_needed, job))
+                        end
+                        if re_gathered > 0 then
+                            Debug.log(('  re-gathered %d additional slip(s) before %s'):format(re_gathered, job))
+                            coroutine.sleep(1.0)
+                        end
+                    end
+
+                    -- Reset per-job state and configure for this job
+                    State.reset_job()
+                    if is_pack then
+                        State.store = item_ids
+                        State.storing_items = true
+                    else
+                        State.retrieve = item_ids
+                        State.storing_items = false
+                    end
+                    State.continuous = true
+
+                    Msg.bulk_job_header(job_idx, #jobs_list, job, is_pack and 'pack' or 'unpack', in_bag_count)
+
+                    Debug.log(
+                        ('--> calling continuous_porter for %s (in_bags=%s, inv_free=%d)'):format(
+                            job,
+                            tostring(in_bag_count),
+                            Inv.space_available(0)
+                        )
+                    )
+                    Flow.continuous_porter()
+
+                    -- Capture per-job totals (continuous_porter sets these at line 371-372
+                    -- of flow.lua) and add to the bulk-wide accumulator.
+                    local job_items = State.async_total_items or 0
+                    local job_slips = State.async_total_slips or 0
+                    total_items = total_items + job_items
+                    total_slips = total_slips + job_slips
+
+                    local job_attempts = State.async_trade_attempts
+                    local job_successes = State.async_trade_successes
+                    Debug.log(
+                        ('<-- %s done (items=%d, slips=%d, attempts=%d, successes=%d, inv_free=%d, state=%d)'):format(
+                            job,
+                            job_items,
+                            job_slips,
+                            job_attempts,
+                            job_successes,
+                            Inv.space_available(0),
+                            State.packet_state
+                        )
+                    )
+
+                    total_done = total_done + 1
+
+                    -- Stall detection
+                    if job_attempts > 0 and job_successes == 0 then
+                        stalled_jobs = stalled_jobs + 1
+                        Msg.warning(('Job %s: %d trade(s) failed, server not responding'):format(job, job_attempts))
+                        Debug.log(
+                            ('STALL #%d on job %s (%d attempts, 0 successes)'):format(stalled_jobs, job, job_attempts)
+                        )
+                        if stalled_jobs >= 2 then
+                            Msg.error('Network deadlock detected (2 jobs failed in a row).')
+                            Msg.error('FFXI client packet stuck - zone to recover, then retry.')
+                            Debug.log('===== BULK ABORTED: deadlock detected =====')
+                            total_aborted = #jobs_list - job_idx
+                            break
+                        end
+                    else
+                        stalled_jobs = 0
+                    end
+                end
+            end
+        end
+    end
+
+    -- Post-return slips once at the very end (skipped when caller is in swap
+    -- mode and will do its own final return after the unpack phase).
+    if defer_slip_return then
+        Debug.log('Slip return deferred to caller (swap mode)')
+    else
+        Debug.log('--- Post-return slips to satchel ---')
+        local returned = Inv.return_slips_to_home()
+        Debug.log(('return_slips_to_home: %d slips, inv_free=%d'):format(returned, Inv.space_available(0)))
+        if returned > 0 then
+            Msg.info(('Returned %d storage slip(s) to satchel'):format(returned))
+        end
+    end
+
+    Debug.log(
+        ('===== BULK COMPLETE: %d done, %d skipped, %d aborted ====='):format(total_done, total_skipped, total_aborted)
+    )
+
+    Msg.bulk_end(action_label, total_done, total_skipped, total_aborted, total_items, total_slips)
+end
+
+---============================================================================
+--- Export command (//po export [file] [all])
+---============================================================================
+
+local function export_op(commands, player, all_arg)
+    local str = 'return {\n'
+    local bags = {0}
+    if all_arg then
+        bags = {0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+    end
+    for _, bag_id in pairs(bags) do
+        -- get_items returns nil for disabled bags (mog wardrobe outside moghouse)
+        local bag_items = windower.ffxi.get_items(bag_id)
+        if bag_items then
+            for _, item in ipairs(bag_items) do
+                if SlipsLookup.get_slip_id(item.id) and res.items[item.id] then
+                    str = str .. ('\t"%s",\n'):format(res.items[item.id].name)
+                end
+            end
+        end
+    end
+    str = str .. '}\n'
+    local file_path = windower.addon_path .. '/data/'
+    if not windower.dir_exists(file_path) then
+        windower.create_dir(file_path)
+    end
+    local out_name
+    if all_arg then
+        out_name = ('export_%s_%s'):format(player.name, player.main_job)
+    else
+        out_name = commands[2] or ('export_%s_%s'):format(player.name, player.main_job)
+    end
+    local full_path = file_path .. out_name .. '.lua'
+    local export, err = io.open(full_path, 'w')
+    if not export then
+        Msg.error(('Could not write %s: %s'):format(out_name .. '.lua', tostring(err)))
+        return
+    end
+    export:write(str)
+    export:close()
+    Msg.success(('Exported storable inventory to ' .. Msg.C.cyan .. '%s.lua'):format(out_name))
+end
+
+---============================================================================
+--- Addon command handler
+---============================================================================
+---
+--- Command set (5 primaries + utilities):
+---     //po                       -> swap to current job (pack others + unpack)
+---     //po <JOB>                 -> swap to <JOB>
+---     //po u [JOB]               -> unpack only (alias: unpack)
+---     //po p [JOB]               -> pack only (alias: pack)
+---     //po all                   -> pack ALL jobs (alias: packall)
+---     //po fetch                 -> unpack all Active (alias: unpackall)
+---     //po fetch inactive        -> unpack all Inactive
+---     //po s [JOB|all|inactive]  -> show storage status (alias: status)
+---     //po help / debug / reset / slips / export   -> utilities
+---============================================================================
+
+--- Run a single-job pack-or-unpack flow.
+--- @param mode      string   'unpack' | 'pack' | 'swap'  (swap = auto-pack-others + unpack)
+--- @param target    string   job code (e.g. 'PLD'); defaults handled by caller
+--- @param player    table    windower player object
+local function single_job_op(mode, target, player)
+    local target_upper = target:upper()
+    local is_pack = (mode == 'pack')
+    local is_unpack = (mode == 'unpack')
+    local is_swap = (mode == 'swap')
+
+    -- Swap = pack everything else first, then unpack the target.
+    if is_swap then
+        Msg.action('AUTO PACK ALL', 'before unpacking ' .. target_upper .. ' (skip ' .. target_upper .. ')', true)
+        Debug.log(('===== AUTO PACK ALL before unpack %s (skip %s) ====='):format(target_upper, target_upper))
+        -- Pre-load the target's UNPACK list and pass it as an exclusion set
+        -- to the pack phase. Items destined for unpack (e.g. Naegling shared
+        -- across every job's pack list) stay in inv through the pack phase
+        -- instead of being stored and immediately re-fetched. Saves trades
+        -- proportional to overlap between target.unpack and other jobs' pack.
+        local target_unpack_ids = load_file(target_upper, 'unpack')
+        if target_unpack_ids then
+            local n = 0
+            for _ in pairs(target_unpack_ids) do n = n + 1 end
+            Debug.log(('PACK exclusion set: %d items from %s.unpack will stay in inv'):format(n, target_upper))
+        end
+        -- mode=nil = full job list. defer_slip_return=true so slips stay in
+        -- inv for the upcoming unpack phase (saves a return + re-gather cycle).
+        bulk_op(true, player, target_upper, nil, true, target_unpack_ids)
+        Debug.log('AUTO PACK ALL complete - 2s settle before unpack')
+        coroutine.sleep(2.0)
+        State.reset_job()
+    end
+
+    -- Load the target job's item list with mode-appropriate filter:
+    -- - pack/swap-source: wide list (everything storable, even unused items)
+    -- - unpack/swap-target: narrow list (items actually used in the active sets)
+    local item_ids = load_file(target_upper, is_pack and 'pack' or 'unpack')
+    if not item_ids then
+        return
+    end
+
+    if is_pack then
+        State.store = item_ids
+        State.storing_items = true
+    else
+        State.retrieve = item_ids
+        State.storing_items = false
+    end
+    State.continuous = true -- always run in bulk mode for single-job actions
+
+    local action_label = is_pack and 'PACK' or (is_swap and 'SWAP' or 'UNPACK')
+    Msg.action(action_label, target_upper, true)
+
+    local gathered, needed, pending = Inv.gather_slips_from_home()
+    if needed and needed > 0 then
+        Msg.error(
+            ('Inventory full: need %d more free slot(s) to gather all storage slips ' ..
+                '(%d still pending). Make space and retry.'):format(needed, pending - gathered)
+        )
+        Debug.log(('ABORT: inv full, missing %d slots, %d slips ungathered'):format(needed, pending - gathered))
+        return
+    end
+    if gathered > 0 then
+        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
+    end
+
+    Flow.continuous_porter()
+    local returned = Inv.return_slips_to_home()
+    if returned > 0 then
+        Msg.info(('Returned %d storage slip(s) to satchel'):format(returned))
+    end
+    Msg.completed()
+end
+
+--- Print storage status: per-job count of items currently in bags vs total.
+--- @param scope  string  'active' | 'inactive' | 'all' | <JOB code>
+local function status_op(scope, player)
+    local current_job = (player and player.main_job) or '?'
+    local jobs_list, header_label
+
+    scope = (scope or 'active'):lower()
+    if scope == 'inactive' then
+        jobs_list = Config.get_inactive_jobs_packlist()
+        header_label = 'Inactive'
+    elseif scope == 'all' then
+        jobs_list = Config.get_jobs_packlist()
+        header_label = 'All jobs'
+    elseif Config.VALID_JOBS[scope:upper()] then
+        jobs_list = {scope:upper()}
+        header_label = scope:upper()
+    else
+        jobs_list = Config.get_active_jobs_packlist()
+        header_label = 'Active'
+    end
+
+    local rows = {}
+    for _, job in ipairs(jobs_list) do
+        local item_ids = load_file(job)
+        if item_ids then
+            local n_total = 0
+            for _ in pairs(item_ids) do
+                n_total = n_total + 1
+            end
+            local n_in_bag = count_items_in_bags(item_ids)
+            local status
+            if n_in_bag == 0 then
+                status = 'stored'
+            elseif n_in_bag >= n_total then
+                status = 'out'
+            else
+                status = 'MIXED'
+            end
+            table.insert(
+                rows,
+                {
+                    job = job,
+                    in_bag = n_in_bag,
+                    total = n_total,
+                    status = status,
+                    current = (job == current_job:upper())
+                }
+            )
+        end
+    end
+
+    Msg.show_status(header_label, rows, current_job)
+end
+
+windower.register_event(
+    'addon command',
+    function(...)
+        local commands = {...}
+        local player = windower.ffxi.get_player()
+        if not player then
+            return
+        end
+        -- Re-read per-character config so ignore_bags / slip_home_bag etc. are
+        -- always current (cheap: just reads one optional file at <char>/config.lua).
+        Config.refresh()
+        -- Drop the load_file cache so per-char config changes (and edits to
+        -- data files between commands) always take effect. Within a single
+        -- command, the cache survives across the multiple load_file calls a
+        -- swap performs (target unpack + per-job pack lists + target unpack
+        -- again), eliminating the expensive res.items re-scans.
+        load_file_cache = {}
+        local cmd = commands[1] and commands[1]:lower() or nil
+        local arg = commands[2] and commands[2]:lower() or nil
+
+        -- ---- help ---------------------------------------------------------------
+        if cmd == 'help' or cmd == '?' then
+            Msg.show_help()
+            return
+        end
+
+        -- ---- bare //po = SWAP to current job (most common action) ---------------
+        if not cmd then
+            if State.packet_state ~= 0 or player.status ~= 0 then
+                Msg.busy(State.packet_state, player.status)
+                return
+            end
+            single_job_op('swap', player.main_job, player)
+            return
+        end
+
+        -- ---- debug toggle -------------------------------------------------------
+        if cmd == 'debug' then
+            if arg == 'on' or arg == '1' or arg == 'enable' then
+                Debug.clear()
+                State.debug_enabled = true
+                Debug.log('===== Debug session started =====')
+                Msg.success('Debug logging ENABLED -> ' .. Msg.C.cyan .. Debug.log_path)
+            elseif arg == 'off' or arg == '0' or arg == 'disable' then
+                State.debug_enabled = false
+                Msg.notice('Debug logging DISABLED')
+            else
+                Msg.notice('Usage: //po debug on | off')
+                Msg.notice('Log file: ' .. Debug.log_path)
+            end
+            return
+        end
+
+        -- ---- status (read-only, never busy-blocked) ----------------------------
+        if cmd == 'status' or cmd == 's' or cmd == 'info' then
+            status_op(arg, player)
+            return
+        end
+
+        -- ---- reset / unstuck ---------------------------------------------------
+        if cmd == 'reset' or cmd == 'unstuck' then
+            State.reset_all()
+            Msg.success('State machine reset - addon unstuck')
+            return
+        end
+
+        -- ---- export ------------------------------------------------------------
+        if cmd == 'export' or cmd == 'exp' then
+            local all_set = S {'all', 'a', 'continuous'}
+            local all_arg = all_set:contains(commands[2]) or all_set:contains(commands[3])
+            export_op(commands, player, all_arg)
+            return
+        end
+
+        -- ---- slips: manually return any leftover slips to satchel --------------
+        if cmd == 'slips' or cmd == 'returnslips' or cmd == 'rs' then
+            local returned = Inv.return_slips_to_home()
+            if returned > 0 then
+                Msg.success(('Returned %d storage slip(s) to satchel'):format(returned))
+            else
+                Msg.notice('No storage slips in inventory to return.')
+            end
+            return
+        end
+
+        -- ---- busy guard for the action commands below --------------------------
+        if State.packet_state ~= 0 or player.status ~= 0 then
+            Msg.busy(State.packet_state, player.status)
+            return
+        end
+
+        -- ---- bulk: pack ALL ----------------------------------------------------
+        if cmd == 'all' or cmd == 'packall' then
+            bulk_op(true, player, nil, nil) -- mode=nil => Active + Inactive
+            return
+        end
+
+        -- ---- bulk: unpack Active (default) or Inactive -------------------------
+        if cmd == 'fetch' or cmd == 'unpackall' then
+            if arg == 'inactive' or arg == 'i' then
+                bulk_op(false, player, nil, 'inactive')
+            else
+                bulk_op(false, player, nil, 'active')
+            end
+            return
+        end
+
+        -- ---- single-job: unpack only -------------------------------------------
+        if cmd == 'unpack' or cmd == 'u' then
+            local target = (arg and arg:upper()) or player.main_job
+            single_job_op('unpack', target, player)
+            return
+        end
+
+        -- ---- single-job: pack only ---------------------------------------------
+        if cmd == 'pack' or cmd == 'p' then
+            local target = (arg and arg:upper()) or player.main_job
+            single_job_op('pack', target, player)
+            return
+        end
+
+        -- ---- single-job: SWAP (pack others + unpack) ---------------------------
+        -- Triggered by: //po swap [JOB]   OR   //po <JOB>   (bare job code)
+        if cmd == 'swap' then
+            local target = (arg and arg:upper()) or player.main_job
+            single_job_op('swap', target, player)
+            return
+        end
+        if Config.VALID_JOBS[cmd:upper()] then
+            single_job_op('swap', cmd:upper(), player)
+            return
+        end
+
+        -- ---- unknown -----------------------------------------------------------
+        Msg.error(('Unknown command: "%s". Type //po help for the list.'):format(cmd))
+    end
+)

@@ -1,0 +1,32 @@
+PorterPacker
+Copyright (c) 2026, ejouanchicot
+
+This product is licensed under the BSD 3-Clause License. See LICENSE.
+
+
+PRIOR WORK
+----------
+
+PorterPacker started life as an addon written by Ivaar, later modified by
+Gimlic and Siyual. Working out how to talk to the Porter Moogle at all -- which
+packets carry the menu, where the slip index sits, how the contents bitfield is
+laid out, which sentinel closes the dialog -- was their doing, and it is the
+hard part of this addon.
+
+The code here is not theirs. Every module was written for this project: the
+packet layer, the inventory primitives, the trade orchestration, the per
+character data format and the messaging. What carries over from the original is
+the protocol knowledge itself -- packet identifiers, byte offsets, zone and menu
+ids -- which is factual description of how the game behaves rather than
+authored expression.
+
+Credit for that discovery belongs to Ivaar, Gimlic and Siyual, and this notice
+exists to record it.
+
+The original is published without a license at:
+
+    https://github.com/Ivaar/Windower-addons
+
+Anyone with a claim to that work who sees it differently is welcome to raise it:
+
+    https://github.com/ejouanchicot/PorterPacker/issues
