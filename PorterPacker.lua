@@ -736,6 +736,19 @@ local function single_job_op(mode, target, player)
         return
     end
 
+    -- Clear whatever the last command left behind before configuring this one.
+    --
+    -- Only the swap path used to reset here, so a plain pack or unpack started
+    -- with the previous command's lists still in State. That matters because
+    -- find_porter_items treats State.original_retrieve as an exclusion set: a
+    -- pack run straight after a swap onto the same job would hide exactly the
+    -- gear that swap had just fetched -- which is the gear the pack is there to
+    -- put away. The pre-scan therefore reported nothing to store, while the
+    -- trade loop, running after run_bulk_transfer had cleared the field, found
+    -- slips to trade after all. The two disagreed because they were reading
+    -- different state, not different bags.
+    State.reset_job()
+
     if is_pack then
         State.store = item_ids
         State.storing_items = true
