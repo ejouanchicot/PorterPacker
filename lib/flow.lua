@@ -306,14 +306,21 @@ local function run_pack_phase(npc, origins)
         for slip_id, group in pairs(groups) do
             if is_tradeable(group, slip_id) then
                 -- Bring the slip and its cargo into inventory to trade from.
-                -- Nothing moved means nothing to wait for.
+                --
+                -- The pause here is unconditional on purpose. It was briefly
+                -- made to depend on whether items moved, on the reasoning that
+                -- nothing moved means nothing to wait for. Timeouts followed:
+                -- trades left the client with the porter never opening its
+                -- menu (state stuck at 1), after the loop had run three
+                -- pull/file cycles inside a single second. Whether or not that
+                -- was the cause, this pause is the only spacing between a burst
+                -- of item-movement packets and the trade that follows them, and
+                -- it is not worth the seconds it saves.
                 if Inv.space_available(0) ~= 0 then
                     local stop = Debug.stopwatch('pack:pull-slip-cargo')
                     local pulled = Inv.retrieve_items(group, Config.equippable_bags)
                     stop(('%d of %d item(s)'):format(pulled, #group))
-                    if pulled > 0 then
-                        coroutine.sleep(PAUSE_AFTER_GATHER)
-                    end
+                    coroutine.sleep(PAUSE_AFTER_GATHER)
                 end
 
                 local stop_scan = Debug.stopwatch('pack:rescan-inventory')
@@ -363,11 +370,9 @@ local function run_pack_phase(npc, origins)
                 end
 
                 local stop_return = Debug.stopwatch('pack:file-slip-home')
-                local filed = return_slip_to_origin(slip_id, origins, false)
+                return_slip_to_origin(slip_id, origins, false)
                 stop_return()
-                if filed > 0 then
-                    coroutine.sleep(PAUSE_AFTER_SLIP)
-                end
+                coroutine.sleep(PAUSE_AFTER_SLIP)
 
             elseif #group > 2 and pass == 1 then
                 -- Items are here but their slip is not; tell the user which one.
@@ -519,9 +524,8 @@ local function run_unpack_phase(npc, origins)
             end
 
             if used then
-                if return_slip_to_origin(slip_id, origins, true) > 0 then
-                    coroutine.sleep(PAUSE_AFTER_SLIP)
-                end
+                return_slip_to_origin(slip_id, origins, true)
+                coroutine.sleep(PAUSE_AFTER_SLIP)
             end
         end
 
