@@ -751,14 +751,25 @@ local function single_job_op(mode, target, player)
     -- State.store / State.retrieve are set by now, so we know exactly which
     -- slips this job needs and can leave the rest in the satchel.
     local wanted, wanted_count = slips_needed_now()
+
+    -- An empty set is the one answer we should not trust. It claims the
+    -- operation touches no slip at all, yet the trade loop that follows does
+    -- its own scan and has been seen to find slips to trade anyway -- and a
+    -- trade whose slip was never brought in is a trade the porter ignores,
+    -- which shows up as a timeout with the state machine stuck at 1.
+    --
+    -- Rather than reason about which scan is right, fall back to fetching
+    -- everything, which is what this did before the set was computed at all.
     if wanted_count == 0 then
-        Debug.log(('%s: no slips need gathering'):format(target_upper))
+        Debug.log(('%s: needed-slip set came back empty - fetching all slips'):format(target_upper))
+        wanted = nil
     else
         Debug.log(('%s: %d slip(s) needed (of %d)'):format(
             target_upper, wanted_count, #slips.storages))
-        if not gather_needed_slips(wanted, target_upper) then
-            return
-        end
+    end
+
+    if not gather_needed_slips(wanted, target_upper) then
+        return
     end
 
     Flow.continuous_porter()
