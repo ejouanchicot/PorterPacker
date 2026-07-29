@@ -123,9 +123,10 @@ tell you it "is not in range".
 refuses to start unless your character is idle, because moving mid-run breaks
 the menu sequence.
 
-**3. Make some inventory room.** The addon gathers your slips into your
-inventory before it starts. If it can't fit them it will say exactly how many
-free slots it still needs.
+**3. Make some inventory room.** The addon holds storage slips in your
+inventory while it works. It only fetches the slips your command actually
+needs — usually a handful, not all 33 — so a swap does not require an empty
+bag. If it still cannot fit them it will say exactly how many slots to free.
 
 **4. See where you stand:**
 
@@ -331,9 +332,10 @@ Bag IDs:
 **"... is not in range"**
 You're too far from the Porter Moogle. Walk closer.
 
-**"Inventory full: need N more free slot(s)"**
-The addon needs room to hold your slips while it works. Free up the number of
-slots it asks for and run the command again.
+**"Not enough inventory space: N of M needed slip(s) could not be gathered"**
+The addon holds the storage slips in your inventory while it works. It only
+fetches the ones the command actually needs, so this means you are genuinely
+short — free the number of slots it names and run the command again.
 
 **It says it's busy and won't start**
 Your character isn't idle — you're moving, fighting, resting, or a previous run

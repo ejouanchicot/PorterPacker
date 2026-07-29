@@ -87,7 +87,9 @@ end
 
 --- Collect a snapshot of where the slips sit in a bag, so the indices stay
 --- valid while we move them.
-local function slip_positions(bag_id, skip)
+--- @param skip table|nil slip ids to leave alone
+--- @param only table|nil when given, restrict to these slip ids
+local function slip_positions(bag_id, skip, only)
     local found = {}
     local contents = windower.ffxi.get_items(bag_id)
     if not contents then
@@ -96,24 +98,37 @@ local function slip_positions(bag_id, skip)
 
     for index, item in ipairs(contents) do
         local is_slip = item.id ~= 0 and item.status == 0 and slips.items[item.id]
-        if is_slip and not (skip and skip[item.id]) then
+        local take = is_slip
+            and not (skip and skip[item.id])
+            and (only == nil or only[item.id])
+
+        if take then
             found[#found + 1] = { index = index, count = item.count }
         end
     end
     return found
 end
 
---- Pull every storage slip out of the configured home bag and into inventory,
+--- Pull storage slips out of the configured home bag and into inventory,
 --- skipping any already there.
+---
+--- Pass `only` to fetch just the slips an operation will actually use. A swap
+--- usually touches a handful, and hauling all 33 in costs both inventory space
+--- and several seconds of paced packets. Omit it to take everything.
+---
+--- Under-fetching is safe: the trade flow looks for a slip across every bag it
+--- knows about and pulls it in on demand, so a slip left behind here only costs
+--- a little time, never correctness.
 ---
 --- Reports what it could not do rather than failing silently: when inventory
 --- runs out mid-way the caller gets the exact shortfall so it can tell the user
 --- how many slots to clear.
 ---
+--- @param only table|nil set of slip ids to fetch; nil means every slip
 --- @return number moved   slips successfully pulled
 --- @return number needed  free slots still required (0 when all were gathered)
 --- @return number pending slips that needed gathering at the start
-function M.gather_slips_from_home()
+function M.gather_slips_from_home(only)
     if not windower.ffxi.get_items(Config.SLIP_HOME_BAG) then
         return 0, 0, 0
     end
@@ -126,7 +141,7 @@ function M.gather_slips_from_home()
         end
     end
 
-    local queue   = slip_positions(Config.SLIP_HOME_BAG, in_hand)
+    local queue   = slip_positions(Config.SLIP_HOME_BAG, in_hand, only)
     local pending = #queue
     local needed  = math.max(0, pending - M.space_available(INVENTORY))
     local moved   = 0

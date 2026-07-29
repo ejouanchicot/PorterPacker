@@ -254,6 +254,100 @@ local function count_items_in_bags(item_ids)
 end
 
 ---============================================================================
+--- Working out which storage slips an operation actually needs
+---============================================================================
+--- Fetching all 33 slips costs 33 inventory slots and roughly seven seconds of
+--- paced packets, whether or not the operation touches them. A typical swap
+--- involves a handful. These helpers work out the real set beforehand.
+---
+--- Getting the set slightly wrong is not dangerous: the trade flow searches
+--- every bag for a slip it needs and pulls it in on demand, so a slip missed
+--- here costs a moment, not correctness.
+
+--- Slips that at least one item currently in the bags would be stored on.
+--- Reads the bags rather than the job's item list, because only what you are
+--- actually carrying can be packed.
+local function slips_with_packable_items()
+    local found = {}
+    for slip_id, group in pairs(Packets.find_porter_items(Config.equippable_bags)) do
+        for _, item in ipairs(group) do
+            -- The slip itself sits in its own group; ignore it and look for cargo.
+            if item.id ~= slip_id then
+                found[slip_id] = true
+                break
+            end
+        end
+    end
+    return found
+end
+
+--- Slips currently holding at least one item on the retrieve list.
+local function slips_holding_wanted_items()
+    local found = {}
+    for slip_id, contents in pairs(slips.get_player_items()) do
+        if contents.n ~= 0 then
+            for _, item_id in ipairs(contents) do
+                if State.retrieve[item_id] then
+                    found[slip_id] = true
+                    break
+                end
+            end
+        end
+    end
+    return found
+end
+
+--- Everything the pending operation will touch, derived from State.
+--- @return table set of slip ids
+--- @return number how many
+local function slips_needed_now()
+    local needed = {}
+
+    if State.storing_items then
+        for slip_id in pairs(slips_with_packable_items()) do
+            needed[slip_id] = true
+        end
+    end
+
+    if next(State.retrieve) then
+        for slip_id in pairs(slips_holding_wanted_items()) do
+            needed[slip_id] = true
+        end
+    end
+
+    local count = 0
+    for _ in pairs(needed) do
+        count = count + 1
+    end
+    return needed, count
+end
+
+--- Bring in the slips an operation needs, and say precisely what is missing
+--- when inventory cannot hold them.
+--- @param wanted table|nil set of slip ids, or nil to fetch every slip
+--- @param context string label for the debug log
+--- @return boolean ok      false when the caller should abort
+--- @return number  gathered
+local function gather_needed_slips(wanted, context)
+    local gathered, needed, pending = Inv.gather_slips_from_home(wanted)
+
+    if needed and needed > 0 then
+        local left_behind = pending - gathered
+        Msg.error(('Not enough inventory space: %d of %d needed slip(s) could not be gathered.')
+            :format(left_behind, pending))
+        Msg.error(('Free %d more inventory slot(s), then run the command again.'):format(needed))
+        Debug.log(('ABORT [%s]: missing %d slots, %d of %d slips ungathered'):format(
+            context, needed, left_behind, pending))
+        return false, gathered
+    end
+
+    if gathered > 0 then
+        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
+    end
+    return true, gathered
+end
+
+---============================================================================
 --- Bulk operation: iterate the active char's job list, packing or unpacking.
 ---============================================================================
 --- @param is_pack    boolean  true = pack everything, false = unpack everything
@@ -323,18 +417,15 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
         )
     )
 
-    -- Pre-gather slips once
-    local gathered, needed, pending = Inv.gather_slips_from_home()
-    if needed and needed > 0 then
-        Msg.error(
-            ('Inventory full: need %d more free slot(s) to gather all storage slips ' ..
-                '(%d still pending). Make space and retry.'):format(needed, pending - gathered)
-        )
-        Debug.log(('ABORT: inv full, missing %d slots, %d slips ungathered'):format(needed, pending - gathered))
+    -- Pre-gather slips once. Packing can see what is in the bags and so knows
+    -- exactly which slips it will use; unpacking has not loaded the per-job
+    -- item lists yet, so it still has to take everything.
+    local wanted = is_pack and slips_with_packable_items() or nil
+    local ok, gathered = gather_needed_slips(wanted, 'bulk')
+    if not ok then
         return
     end
     if gathered > 0 then
-        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
         Debug.log(('gathered %d slips - 2s settle'):format(gathered))
         coroutine.sleep(2.0)
     end
@@ -411,7 +502,16 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
 
                     -- Re-gather any missing slips. Idempotent: skips slips already in inv.
                     if job_idx > 1 then
-                        local re_gathered, re_needed = Inv.gather_slips_from_home()
+                        -- State.store still holds the previous job's list here,
+                        -- and it is not replaced until reset_job() below. Clear
+                        -- it for the scan so every packable item is considered,
+                        -- not just the ones the last job happened to want.
+                        local previous_store = State.store
+                        State.store = {}
+                        local re_wanted = is_pack and slips_with_packable_items() or nil
+                        State.store = previous_store
+
+                        local re_gathered, re_needed = Inv.gather_slips_from_home(re_wanted)
                         if re_needed and re_needed > 0 then
                             Msg.warning(
                                 ('Could not gather all slips before %s: need %d more inv slot(s)'):format(
@@ -626,17 +726,17 @@ local function single_job_op(mode, target, player)
     local action_label = is_pack and 'PACK' or (is_swap and 'SWAP' or 'UNPACK')
     Msg.action(action_label, target_upper, true)
 
-    local gathered, needed, pending = Inv.gather_slips_from_home()
-    if needed and needed > 0 then
-        Msg.error(
-            ('Inventory full: need %d more free slot(s) to gather all storage slips ' ..
-                '(%d still pending). Make space and retry.'):format(needed, pending - gathered)
-        )
-        Debug.log(('ABORT: inv full, missing %d slots, %d slips ungathered'):format(needed, pending - gathered))
-        return
-    end
-    if gathered > 0 then
-        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
+    -- State.store / State.retrieve are set by now, so we know exactly which
+    -- slips this job needs and can leave the rest in the satchel.
+    local wanted, wanted_count = slips_needed_now()
+    if wanted_count == 0 then
+        Debug.log(('%s: no slips need gathering'):format(target_upper))
+    else
+        Debug.log(('%s: %d slip(s) needed (of %d)'):format(
+            target_upper, wanted_count, #slips.storages))
+        if not gather_needed_slips(wanted, target_upper) then
+            return
+        end
     end
 
     Flow.continuous_porter()
