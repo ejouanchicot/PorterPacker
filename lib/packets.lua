@@ -192,8 +192,16 @@ function M.wait_for_trades()
         return
     end
 
+    -- This is the one span we cannot shorten: it is the porter answering.
+    -- Everything else around a trade is our own code and is fair game.
+    Debug.log(('  timing %-24s %8.1fms | %d polls'):format(
+        'server:menu-dialog', (os.clock() - started_clock) * 1000, polls))
+
     State.async_trade_successes = State.async_trade_successes + 1
+
+    local stop = Debug.stopwatch('settle:post-trade')
     coroutine.sleep(TRADE_SETTLE_SECONDS)  -- let trailing packets land
+    stop()
 end
 
 -- ===========================================================================

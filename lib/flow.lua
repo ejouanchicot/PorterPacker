@@ -294,11 +294,17 @@ local function run_pack_phase(npc, groups, origins)
             if is_tradeable(group, slip_id) then
                 -- Bring the slip and its cargo into inventory to trade from.
                 if Inv.space_available(0) ~= 0 then
+                    local stop = Debug.stopwatch('pack:pull-slip-cargo')
                     Inv.retrieve_items(group, Config.equippable_bags)
+                    stop(('%d item(s)'):format(#group))
                     coroutine.sleep(PAUSE_AFTER_GATHER)
                 end
 
-                for ready_slip_id, ready_group in pairs(Packets.find_porter_items({ 0 })) do
+                local stop_scan = Debug.stopwatch('pack:rescan-inventory')
+                local ready = Packets.find_porter_items({ 0 })
+                stop_scan()
+
+                for ready_slip_id, ready_group in pairs(ready) do
                     if is_tradeable(ready_group, ready_slip_id) then
                         npc = require_porter()
                         if not npc then
@@ -313,7 +319,9 @@ local function run_pack_phase(npc, groups, origins)
                             progressed = true
 
                             -- Keep inventory clear for the trades that follow.
+                            local stop_flush = Debug.stopwatch('pack:flush-inventory')
                             Inv.put_away_items(State.original_retrieve, Config.bag_priority)
+                            stop_flush()
 
                             Msg.stored(item_count, slip_num)
                             packed_items = packed_items + item_count
@@ -338,7 +346,9 @@ local function run_pack_phase(npc, groups, origins)
                     break
                 end
 
+                local stop_return = Debug.stopwatch('pack:file-slip-home')
                 return_slip_to_origin(slip_id, origins, false)
+                stop_return()
                 coroutine.sleep(PAUSE_AFTER_SLIP)
 
             elseif #group > 2 and pass == 1 then
@@ -359,13 +369,17 @@ end
 --- Returns how many items came back and whether the trade stalled, which the
 --- caller uses to tell "this slip is done" from "the server stopped answering".
 local function unpack_one_slip(npc, slip_id)
+    local stop_find = Debug.stopwatch('unpack:locate-slip')
     local slip_item = Inv.find_item(Config.slip_bags, slip_id, 1)
+    stop_find()
     if not slip_item then
         return nil
     end
 
     -- The slip has to be in hand before it can be traded.
+    local stop_pull = Debug.stopwatch('unpack:pull-slip')
     Inv.retrieve_items({ slip_item }, Config.equippable_bags)
+    stop_pull()
     coroutine.sleep(PAUSE_AFTER_PULL)
 
     slip_item = Inv.find_item({ slips.default_storages[1] }, slip_id, 1)
@@ -385,6 +399,12 @@ local function unpack_one_slip(npc, slip_id)
 
     -- A slip can return several items in one go, so count what actually landed
     -- rather than assuming one item per trade.
+    --
+    -- Instrumented because this is a find_item per outstanding item, and each
+    -- of those walks every slip bag: the cost scales with the retrieve list,
+    -- not with what this slip returned.
+    local stop_count = Debug.stopwatch('unpack:account-arrivals')
+    local outstanding = table.length(State.retrieve)
     local recovered = 0
     for item_id in pairs(State.retrieve) do
         if Inv.find_item(Config.slip_bags, item_id, 1) then
@@ -392,6 +412,7 @@ local function unpack_one_slip(npc, slip_id)
             recovered = recovered + 1
         end
     end
+    stop_count(('%d scanned, %d found'):format(outstanding, recovered))
 
     Msg.retrieved(recovered, slip_num)
     return recovered, stalled
@@ -425,7 +446,9 @@ local function run_unpack_phase(npc, origins)
     while table.length(State.retrieve) > 0 and pass < MAX_UNPACK_PASSES do
         -- Make room before walking the slips: a pass that starts with a full
         -- inventory retrieves nothing and would trip the no-progress exit.
+        local stop_flush = Debug.stopwatch('unpack:flush-before-pass')
         Inv.put_away_items(State.original_retrieve, Config.bag_priority)
+        stop_flush(('pass %d'):format(pass))
 
         local outstanding = table.length(State.retrieve)
         if outstanding == previous_outstanding then

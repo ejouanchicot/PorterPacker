@@ -25,6 +25,30 @@ function M.log(line)
     end
 end
 
+--- Start a stopwatch for one span of work.
+---
+--- Returns a function that logs how long the span took when called. When debug
+--- is off it returns a do-nothing closure, so call sites need no guard.
+---
+--- Spans are logged indented under `timing` so a run can be summarised with
+--- `grep timing debug.log`.
+---
+--- @param label string short name for the span
+--- @return function stop  call with an optional note to close the span
+function M.stopwatch(label)
+    if not State.debug_enabled then
+        return function() end
+    end
+
+    local started = os.clock()
+    return function(note)
+        local elapsed_ms = (os.clock() - started) * 1000
+        M.log(('  timing %-24s %8.1fms%s'):format(
+            label, elapsed_ms, note and (' | ' .. note) or ''))
+        return elapsed_ms
+    end
+end
+
 --- Truncate the log file. Called when debug is enabled to start fresh.
 function M.clear()
     local f = io.open(M.log_path, 'w')
