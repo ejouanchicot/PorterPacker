@@ -33,8 +33,15 @@ local M = {}
 
 local PORTER = 'Porter Moogle'
 
--- Two failed trades back to back means the client's packet queue has jammed;
--- pushing further just produces more timeouts.
+-- How many times to offer a slip its batch before treating the silence as real.
+-- The porter intermittently ignores a trade, and the same batch goes through on
+-- the next attempt, so one silence is not evidence of anything.
+local TRADE_ATTEMPTS = 3
+local RETRY_BACKOFF  = 1.0
+
+-- A slip that stays silent across all its attempts, twice running, means the
+-- client's packet queue has jammed; pushing further just produces more of the
+-- same.
 local DEADLOCK_STRIKES = 2
 
 -- Upper bounds so a slip that never resolves cannot spin forever.
@@ -277,6 +284,17 @@ local function describe_group(group)
     return table.concat(parts, ', ')
 end
 
+--- Find the current, tradeable batch for a slip, with slot numbers as they are
+--- right now. Returns nil when the slip has nothing left to hand over.
+local function current_batch_for(slip_id)
+    for candidate_id, candidate in pairs(Packets.find_porter_items({ 0 })) do
+        if candidate_id == slip_id and is_tradeable(candidate, slip_id) then
+            return candidate
+        end
+    end
+    return nil
+end
+
 --- Trade one group and wait for the server. Returns whether it went through.
 local function trade_and_wait(npc, group, slip_num, item_count)
     Msg.progress('Packing', slip_num, item_count)
@@ -291,6 +309,54 @@ local function trade_and_wait(npc, group, slip_num, item_count)
 
     State.packet_state = 0  -- clear the stuck state so the next trade can run
     return false
+end
+
+--- Hand a slip's batch over, trying again if the porter stays silent.
+---
+--- A timeout leaves the state machine at 1, meaning no menu was ever opened and
+--- the batch was not taken. In practice this is intermittent: the same slip,
+--- with the same batch, goes through moments later. Abandoning the slip after
+--- one silence loses gear for no reason, and two such silences in a row used to
+--- stop the whole pack.
+---
+--- Each retry rescans the inventory instead of resending the original batch.
+--- Slot numbers are captured when a batch is built, so if the trade did land
+--- while we were not looking, those slots now hold something else and resending
+--- them would trade the wrong items. The rescan either produces a batch with
+--- current slots, or reports the slip has nothing left -- which means the silent
+--- trade went through after all.
+---
+--- @return boolean traded
+--- @return number|nil items handed over; nil means the Moogle went out of range
+local function trade_slip_with_retries(npc, group, slip_id, slip_num)
+    local batch = group
+
+    for attempt = 1, TRADE_ATTEMPTS do
+        if attempt > 1 then
+            coroutine.sleep(RETRY_BACKOFF)
+
+            batch = current_batch_for(slip_id)
+            if not batch then
+                Debug.log(('slip %d has nothing left to hand over - the silent trade landed')
+                    :format(slip_num))
+                return true, 0
+            end
+
+            npc = require_porter()
+            if not npc then
+                return false, nil
+            end
+
+            Debug.log(('slip %d: attempt %d of %d'):format(slip_num, attempt, TRADE_ATTEMPTS))
+        end
+
+        local item_count = #batch - 1
+        if trade_and_wait(npc, batch, slip_num, item_count) then
+            return true, item_count
+        end
+    end
+
+    return false, 0
 end
 
 --- Pack everything the store filter matched.
@@ -354,9 +420,15 @@ local function run_pack_phase(npc, origins)
                         end
 
                         local slip_num   = slips.get_slip_number_by_id(ready_slip_id)
-                        local item_count = #ready_group - 1
+                        local traded, item_count = trade_slip_with_retries(
+                            npc, ready_group, ready_slip_id, slip_num)
 
-                        if trade_and_wait(npc, ready_group, slip_num, item_count) then
+                        -- A lost Moogle is reported as an abort, not a failure.
+                        if item_count == nil then
+                            return packed_items, packed_slips, true
+                        end
+
+                        if traded then
                             strikes = 0
                             progressed = true
 
@@ -365,9 +437,11 @@ local function run_pack_phase(npc, origins)
                             Inv.put_away_items(State.original_retrieve, Config.bag_priority)
                             stop_flush()
 
-                            Msg.stored(item_count, slip_num)
-                            packed_items = packed_items + item_count
-                            packed_slips = packed_slips + 1
+                            if item_count > 0 then
+                                Msg.stored(item_count, slip_num)
+                                packed_items = packed_items + item_count
+                                packed_slips = packed_slips + 1
+                            end
                         else
                             strikes = strikes + 1
                             Debug.log(('PACK trade TIMEOUT slip=%d (consec=%d)'):format(
