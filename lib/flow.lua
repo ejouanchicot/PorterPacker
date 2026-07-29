@@ -99,6 +99,7 @@ end
 --- `verify_in_hand` covers the unpack path, where the last candidate bag is
 --- only correct if the slip really is in hand; without that check a slip that
 --- never made it back to inventory would be filed in the wrong place.
+--- @return number how many slips were actually moved
 local function return_slip_to_origin(slip_id, origins, verify_in_hand)
     for position, origin in ipairs(SLIP_ORIGINS) do
         local group = origins[origin.key][slip_id]
@@ -107,13 +108,13 @@ local function return_slip_to_origin(slip_id, origins, verify_in_hand)
             local is_last = position == #SLIP_ORIGINS
             if verify_in_hand and is_last
                 and not Inv.find_item({ slips.default_storages[1] }, slip_id, 1) then
-                return
+                return 0
             end
 
-            Inv.put_away_items({ [slip_id] = true }, { origin.bag })
-            return
+            return Inv.put_away_items({ [slip_id] = true }, { origin.bag })
         end
     end
+    return 0
 end
 
 --- Anything from the original request that is still parked on a slip goes back
@@ -281,7 +282,7 @@ end
 ---
 --- @return number items packed
 --- @return number slips packed
-local function run_pack_phase(npc, groups, origins)
+local function run_pack_phase(npc, origins)
     local packed_items, packed_slips = 0, 0
     local strikes = 0
     local pass = 1
@@ -290,14 +291,29 @@ local function run_pack_phase(npc, groups, origins)
     while progressed and pass <= MAX_PACK_PASSES do
         progressed = false
 
+        -- Re-read the bags at the start of every pass rather than working from
+        -- the snapshot the first pass used.
+        --
+        -- More passes than one are genuinely needed: a trade carries at most
+        -- eight items, so a slip with more cargo than that has to be visited
+        -- again. But once a slip is emptied it should drop out of the loop, and
+        -- with a stale snapshot it did not -- later passes kept pulling cargo
+        -- that was no longer there, sleeping after it and filing away a slip
+        -- that was already home. The rescan costs about five milliseconds and
+        -- gives the loop an accurate view of what is left.
+        local groups = Packets.find_porter_items(Config.equippable_bags)
+
         for slip_id, group in pairs(groups) do
             if is_tradeable(group, slip_id) then
                 -- Bring the slip and its cargo into inventory to trade from.
+                -- Nothing moved means nothing to wait for.
                 if Inv.space_available(0) ~= 0 then
                     local stop = Debug.stopwatch('pack:pull-slip-cargo')
-                    Inv.retrieve_items(group, Config.equippable_bags)
-                    stop(('%d item(s)'):format(#group))
-                    coroutine.sleep(PAUSE_AFTER_GATHER)
+                    local pulled = Inv.retrieve_items(group, Config.equippable_bags)
+                    stop(('%d of %d item(s)'):format(pulled, #group))
+                    if pulled > 0 then
+                        coroutine.sleep(PAUSE_AFTER_GATHER)
+                    end
                 end
 
                 local stop_scan = Debug.stopwatch('pack:rescan-inventory')
@@ -347,9 +363,11 @@ local function run_pack_phase(npc, groups, origins)
                 end
 
                 local stop_return = Debug.stopwatch('pack:file-slip-home')
-                return_slip_to_origin(slip_id, origins, false)
+                local filed = return_slip_to_origin(slip_id, origins, false)
                 stop_return()
-                coroutine.sleep(PAUSE_AFTER_SLIP)
+                if filed > 0 then
+                    coroutine.sleep(PAUSE_AFTER_SLIP)
+                end
 
             elseif #group > 2 and pass == 1 then
                 -- Items are here but their slip is not; tell the user which one.
@@ -501,8 +519,9 @@ local function run_unpack_phase(npc, origins)
             end
 
             if used then
-                return_slip_to_origin(slip_id, origins, true)
-                coroutine.sleep(PAUSE_AFTER_SLIP)
+                if return_slip_to_origin(slip_id, origins, true) > 0 then
+                    coroutine.sleep(PAUSE_AFTER_SLIP)
+                end
             end
         end
 
@@ -538,7 +557,7 @@ function M.run_bulk_transfer()
     if State.storing_items then
         local aborted
         packed_items, packed_slips, aborted =
-            run_pack_phase(npc, Packets.find_porter_items(Config.equippable_bags), origins)
+            run_pack_phase(npc, origins)
         if aborted then
             return
         end
