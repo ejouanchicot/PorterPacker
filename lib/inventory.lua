@@ -34,6 +34,11 @@ local RETURN_PASSES    = 3
 local PUT_AWAY_PASSES  = 4
 local PUT_AWAY_BACKOFF = 0.1
 
+-- How long to let item data finish arriving after a zone or login before
+-- giving up and proceeding anyway.
+local BAG_LOAD_POLLS    = 20
+local BAG_LOAD_INTERVAL = 0.25
+
 -- ===========================================================================
 -- Bag inspection
 -- ===========================================================================
@@ -48,6 +53,77 @@ function M.space_available(bag_id)
         return 0
     end
     return bag.max - bag.count
+end
+
+--- Whether the client has finished populating the bags we are about to use.
+---
+--- Item data arrives in pieces after a zone or a fresh login: a bag can report
+--- holding twenty items while only a handful of slots have come through. Acting
+--- on that half-built view produces a run that walks every slip, never manages
+--- to assemble a complete slip-plus-cargo batch, and ends having traded nothing.
+---
+--- The client's own count for a bag is the reference. Comparing it against the
+--- slots actually visible says whether the rest is still on its way.
+---
+--- @param bags table array of bag ids to check
+--- @return boolean ready
+--- @return string|nil what disagreed, for the log
+function M.bags_ready(bags)
+    for _, bag_id in ipairs(bags) do
+        local info = windower.ffxi.get_bag_info(bag_id)
+
+        if info and info.enabled then
+            local contents = windower.ffxi.get_items(bag_id)
+            if not contents then
+                return false, ('bag %d has no item data yet'):format(bag_id)
+            end
+
+            local visible = 0
+            for _, item in ipairs(contents) do
+                if item.id ~= 0 then
+                    visible = visible + 1
+                end
+            end
+
+            if visible ~= info.count then
+                return false, ('bag %d shows %d of %d item(s)'):format(bag_id, visible, info.count)
+            end
+        end
+    end
+
+    return true, nil
+end
+
+--- Give the bags a moment to finish arriving.
+---
+--- Returns whether they settled. A false result is not a reason to refuse the
+--- command: this check reads a count the client maintains, and if that count
+--- ever means something other than assumed, a wrong answer here should cost a
+--- few seconds and a log line rather than block the addon outright. Callers
+--- warn and carry on.
+---
+--- @param bags table array of bag ids
+--- @return boolean settled
+function M.wait_for_bags(bags)
+    local ready, reason = M.bags_ready(bags)
+    if ready then
+        return true
+    end
+
+    Debug.log(('waiting for item data: %s'):format(reason))
+
+    for _ = 1, BAG_LOAD_POLLS do
+        coroutine.sleep(BAG_LOAD_INTERVAL)
+        ready, reason = M.bags_ready(bags)
+        if ready then
+            Debug.log('item data complete')
+            return true
+        end
+    end
+
+    Debug.log(('!! item data still incomplete after %.1fs: %s'):format(
+        BAG_LOAD_POLLS * BAG_LOAD_INTERVAL, reason))
+    return false
 end
 
 --- Narrow a bag list down to the ones actually available to write into,

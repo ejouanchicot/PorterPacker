@@ -322,6 +322,20 @@ local function slips_needed_now()
     return needed, count
 end
 
+--- Make sure the client has finished sending item data before we act on it.
+---
+--- Warns and proceeds when it has not: the readiness test reads a count the
+--- client maintains, and if that ever means something other than assumed, the
+--- cost should be a few wasted seconds rather than a command that refuses to
+--- run.
+local function await_item_data()
+    if Inv.wait_for_bags(Config.equippable_bags) then
+        return
+    end
+
+    Msg.warning('Item data still loading - results may be incomplete. Retry in a moment if so.')
+end
+
 --- Bring in the slips an operation needs, and say precisely what is missing
 --- when inventory cannot hold them.
 --- @param wanted table|nil set of slip ids, or nil to fetch every slip
@@ -411,6 +425,8 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
     if skip_upper then
         target_count = target_count - 1
     end
+
+    await_item_data()
 
     Msg.bulk_start(action_label, nil, target_count, skip_upper)
     Debug.log(
@@ -760,6 +776,8 @@ local function single_job_op(mode, target, player)
 
     local action_label = is_pack and 'PACK' or (is_swap and 'SWAP' or 'UNPACK')
     Msg.action(action_label, target_upper, true)
+
+    await_item_data()
 
     -- State.store / State.retrieve are set by now, so we know exactly which
     -- slips this job needs and can leave the rest in the satchel.
