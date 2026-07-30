@@ -383,7 +383,7 @@ end
 -- to go idle. Covers packets the client has queued but not yet put on the wire.
 local INTER_JOB_SETTLE = 2.0
 
-local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclude_ids)
+local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclude_ids, token)
     local skip_upper = skip_job and skip_job:upper() or nil
     local action_label = is_pack and 'PACK ALL' or 'UNPACK ALL'
     if mode == 'active' then
@@ -462,6 +462,14 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
     local stalled_jobs = 0
 
     for job_idx, job in ipairs(jobs_list) do
+        -- A reset, a zone change or a logout during a long run hands ownership
+        -- on; stopping at the job boundary is what lets //po reset end a bulk
+        -- sweep instead of leaving it to grind through every remaining job.
+        if State.superseded(token) then
+            Debug.log('===== BULK ABANDONED: no longer owns the addon =====')
+            return
+        end
+
         -- Caller-requested skip (target of an unpack)
         if skip_upper and job:upper() == skip_upper then
             Debug.log(('SKIP job %s (excluded by caller: target of unpack)'):format(job))
@@ -531,8 +539,11 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
                             ('State stuck (state=%d) before job %s - forcing reset'):format(State.packet_state, job)
                         )
                         Debug.log(('FORCE RESET state from %d to 0 before %s'):format(State.packet_state, job))
-                        State.packet_state = 0
-                        State.last_update = nil
+                        -- Close the menu rather than only forgetting it. A state
+                        -- left non-zero here means a conversation the server still
+                        -- considers open, and it takes no trades until it ends --
+                        -- so every job after this one used to time out too.
+                        Packets.abort_menu()
                         coroutine.sleep(1.0)
                     end
 
@@ -572,7 +583,6 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
                         State.retrieve = item_ids
                         State.storing_items = false
                     end
-                    State.continuous = true
 
                     Msg.bulk_job_header(job_idx, #jobs_list, job, is_pack and 'pack' or 'unpack', in_bag_count)
 
@@ -583,7 +593,7 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
                             Inv.space_available(0)
                         )
                     )
-                    Flow.continuous_porter()
+                    Flow.continuous_porter(token)
 
                     -- Capture per-job totals (continuous_porter sets these at line 371-372
                     -- of flow.lua) and add to the bulk-wide accumulator.
@@ -715,7 +725,7 @@ end
 --- @param mode      string   'unpack' | 'pack' | 'swap'  (swap = auto-pack-others + unpack)
 --- @param target    string   job code (e.g. 'PLD'); defaults handled by caller
 --- @param player    table    windower player object
-local function single_job_op(mode, target, player)
+local function single_job_op(mode, target, player, token)
     local target_upper = target:upper()
     local is_pack = (mode == 'pack')
     local is_unpack = (mode == 'unpack')
@@ -738,7 +748,13 @@ local function single_job_op(mode, target, player)
         end
         -- mode=nil = full job list. defer_slip_return=true so slips stay in
         -- inv for the upcoming unpack phase (saves a return + re-gather cycle).
-        bulk_op(true, player, target_upper, nil, true, target_unpack_ids)
+        bulk_op(true, player, target_upper, nil, true, target_unpack_ids, token)
+
+        if State.superseded(token) then
+            Debug.log('SWAP abandoned after the pack phase: no longer owns the addon')
+            return
+        end
+
         Debug.log('AUTO PACK ALL complete - 2s settle before unpack')
         coroutine.sleep(2.0)
         State.reset_job()
@@ -772,7 +788,6 @@ local function single_job_op(mode, target, player)
         State.retrieve = item_ids
         State.storing_items = false
     end
-    State.continuous = true -- always run in bulk mode for single-job actions
 
     local action_label = is_pack and 'PACK' or (is_swap and 'SWAP' or 'UNPACK')
     Msg.action(action_label, target_upper, true)
@@ -803,7 +818,12 @@ local function single_job_op(mode, target, player)
         return
     end
 
-    Flow.continuous_porter()
+    Flow.continuous_porter(token)
+
+    if State.superseded(token) then
+        return  -- another operation owns the bags now; do not move its slips
+    end
+
     local returned = Inv.return_slips_to_home()
     if returned > 0 then
         Msg.info(('Returned %d storage slip(s) to satchel'):format(returned))
@@ -865,6 +885,48 @@ local function status_op(scope, player)
     Msg.show_status(header_label, rows, current_job)
 end
 
+--- Run one action command with the addon claimed for its whole duration.
+---
+--- The lock is the point of this function. `packet_state` was never one: it sits
+--- at 0 for seconds at a time inside a run -- waiting on item data, settling
+--- between jobs, backing off between retries, throughout every burst of item
+--- movement -- and a command typed in one of those windows used to pass the guard
+--- and start a second flow over the same shared state. Both traded, each consumed
+--- the other's menu answers, neither finished, and //po reset could not stop
+--- either one, because it clears fields and a coroutine is not a field.
+---
+--- Deliberately not wrapped in pcall: every action below sleeps, and yielding
+--- across a pcall boundary is not portable on this runtime. If an action does
+--- throw, the lock stays held and //po reset releases it -- reset_all clears
+--- operation_active as well as bumping the generation.
+local function run_exclusive(action)
+    local token = State.begin_operation()
+    if not token then
+        Msg.already_running()
+        return
+    end
+
+    action(token)
+
+    State.end_operation(token)
+end
+
+-- Zoning or logging out mid-operation used to leave every flag exactly as it
+-- was: a packet state that refused all later commands, lists describing a job
+-- that no longer applies, and a run still grinding through jobs in a zone with
+-- no Moogle in it. Handing ownership on stops the run and clears the slate.
+windower.register_event('zone change', function()
+    if State.operation_active or State.packet_state ~= 0 then
+        Msg.warning('Zoned mid-operation - PorterPacker stopped and reset.')
+        Debug.log('zone change during an operation - reset')
+    end
+    State.reset_all()
+end)
+
+windower.register_event('logout', function()
+    State.reset_all()
+end)
+
 windower.register_event(
     'addon command',
     function(...)
@@ -897,7 +959,9 @@ windower.register_event(
                 Msg.busy(State.packet_state, player.status)
                 return
             end
-            single_job_op('swap', player.main_job, player)
+            run_exclusive(function(token)
+                single_job_op('swap', player.main_job, player, token)
+            end)
             return
         end
 
@@ -926,8 +990,21 @@ windower.register_event(
 
         -- ---- reset / unstuck ---------------------------------------------------
         if cmd == 'reset' or cmd == 'unstuck' then
+            -- Close any menu we may have abandoned before clearing our own view
+            -- of it. A conversation the server still believes is open is what
+            -- makes the porter refuse every later trade, and clearing fields does
+            -- not end one -- which is why this command used to leave the addon
+            -- just as stuck as it found it.
+            --
+            -- Only when there is something to close, though: with nothing in
+            -- flight the newest cached menu belongs to the player, and dismissing
+            -- that is not this command's business.
+            if State.packet_state ~= 0 or State.operation_active then
+                Packets.abort_menu()
+            end
+
             State.reset_all()
-            Msg.success('State machine reset - addon unstuck')
+            Msg.success('State machine reset - any run in progress will stop')
             return
         end
 
@@ -941,12 +1018,17 @@ windower.register_event(
 
         -- ---- slips: manually return any leftover slips to satchel --------------
         if cmd == 'slips' or cmd == 'returnslips' or cmd == 'rs' then
-            local returned = Inv.return_slips_to_home()
-            if returned > 0 then
-                Msg.success(('Returned %d storage slip(s) to satchel'):format(returned))
-            else
-                Msg.notice('No storage slips in inventory to return.')
-            end
+            -- Under the lock like every other command that moves items. It used to
+            -- sit above the guard, so it could be run mid-operation and file the
+            -- slips away while a pack loop was still trading them.
+            run_exclusive(function()
+                local returned = Inv.return_slips_to_home()
+                if returned > 0 then
+                    Msg.success(('Returned %d storage slip(s) to satchel'):format(returned))
+                else
+                    Msg.notice('No storage slips in inventory to return.')
+                end
+            end)
             return
         end
 
@@ -958,31 +1040,36 @@ windower.register_event(
 
         -- ---- bulk: pack ALL ----------------------------------------------------
         if cmd == 'all' or cmd == 'packall' then
-            bulk_op(true, player, nil, nil) -- mode=nil => Active + Inactive
+            run_exclusive(function(token)
+                bulk_op(true, player, nil, nil, nil, nil, token) -- mode=nil => Active + Inactive
+            end)
             return
         end
 
         -- ---- bulk: unpack Active (default) or Inactive -------------------------
         if cmd == 'fetch' or cmd == 'unpackall' then
-            if arg == 'inactive' or arg == 'i' then
-                bulk_op(false, player, nil, 'inactive')
-            else
-                bulk_op(false, player, nil, 'active')
-            end
+            local scope = (arg == 'inactive' or arg == 'i') and 'inactive' or 'active'
+            run_exclusive(function(token)
+                bulk_op(false, player, nil, scope, nil, nil, token)
+            end)
             return
         end
 
         -- ---- single-job: unpack only -------------------------------------------
         if cmd == 'unpack' or cmd == 'u' then
             local target = (arg and arg:upper()) or player.main_job
-            single_job_op('unpack', target, player)
+            run_exclusive(function(token)
+                single_job_op('unpack', target, player, token)
+            end)
             return
         end
 
         -- ---- single-job: pack only ---------------------------------------------
         if cmd == 'pack' or cmd == 'p' then
             local target = (arg and arg:upper()) or player.main_job
-            single_job_op('pack', target, player)
+            run_exclusive(function(token)
+                single_job_op('pack', target, player, token)
+            end)
             return
         end
 
@@ -990,11 +1077,16 @@ windower.register_event(
         -- Triggered by: //po swap [JOB]   OR   //po <JOB>   (bare job code)
         if cmd == 'swap' then
             local target = (arg and arg:upper()) or player.main_job
-            single_job_op('swap', target, player)
+            run_exclusive(function(token)
+                single_job_op('swap', target, player, token)
+            end)
             return
         end
         if Config.VALID_JOBS[cmd:upper()] then
-            single_job_op('swap', cmd:upper(), player)
+            local target = cmd:upper()
+            run_exclusive(function(token)
+                single_job_op('swap', target, player, token)
+            end)
             return
         end
 

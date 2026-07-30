@@ -11,11 +11,6 @@
 ---   1  a trade was injected, waiting for the Moogle to open its menu
 ---   2  the menu is open and we are answering it
 ---   3  we asked to close; waiting for the server to confirm
----
---- Runtime dependency note: the 0x052 handler needs to start the next trade
---- when running one slip at a time, but flow.lua already requires this module.
---- Rather than create an import cycle, flow.lua publishes itself into
---- M.on_slip_finished once it has loaded.
 ---============================================================================
 
 local Config      = require('lib/config')
@@ -26,10 +21,6 @@ local Msg         = require('messages')
 local SlipsLookup = require('lib/slips_lookup')
 
 local M = {}
-
---- Set by flow.lua after load. Invoked when a slip's menu closes cleanly so the
---- single-slip flow can move on to the next one.
-M.on_slip_finished = nil
 
 -- ===========================================================================
 -- Protocol constants
@@ -81,7 +72,18 @@ local SPAWN_TYPE_NPC  = 2
 local AUGMENT_FRIENDLY_SLIP = 13
 
 -- How long to wait for the server to acknowledge a trade before giving up.
-local TRADE_TIMEOUT_SECONDS = 5
+--
+-- Was 5 seconds, which was not enough. Measured menu latency on a good run
+-- reaches 4.36s in the unpack phase (2.4s while packing), so a 5s budget left
+-- under a second of headroom -- one server hiccup and a trade that was going to
+-- land got abandoned. The evidence that these were never real refusals: the same
+-- slip, with the same batch, stores fine on a later run.
+--
+-- 9s nominal, which is roughly 11s of wall clock: the poll loop runs about 1.25x
+-- slower than the sleep interval implies (139 polls measured 4.36s where 3.48s
+-- was nominal), so budgets here are optimistic and the real deadline is longer
+-- than the number. That is the right direction to be wrong in.
+local TRADE_TIMEOUT_SECONDS = 9
 local TRADE_POLL_SECONDS    = 0.025
 local TRADE_SETTLE_SECONDS  = 0.3
 
@@ -166,8 +168,33 @@ function M.trade_npc(npc, items)
     end
 
     State.async_trade_attempts = State.async_trade_attempts + 1
+
+    -- Fresh diagnostics per trade, so a failure reports what happened during
+    -- *this* attempt and not a previous one.
+    State.trade_menu_seen = false
+    State.trade_messages  = {}
+
     windower.packets.inject_outgoing(PACKET_TRADE, build_trade_payload(npc, items))
     State.packet_state = 1
+end
+
+--- Say what the server did while a failed trade was in flight, so the log can
+--- distinguish a refusal from silence.
+--- @return string
+function M.describe_trade_outcome()
+    local parts = {}
+
+    parts[#parts + 1] = State.trade_menu_seen
+        and 'porter DID open a menu'
+        or 'porter opened NO menu'
+
+    if #State.trade_messages == 0 then
+        parts[#parts + 1] = 'server said nothing (silence, not a refusal)'
+    else
+        parts[#parts + 1] = ('server said: %q'):format(table.concat(State.trade_messages, ' | '))
+    end
+
+    return table.concat(parts, '; ')
 end
 
 --- Park the current coroutine until the state machine falls back to idle.
@@ -187,8 +214,9 @@ function M.wait_for_trades()
     end
 
     if State.packet_state ~= 0 then
-        Debug.log(('!! TIMEOUT %.2fs state=%d (started at %d) - server stuck'):format(
-            os.clock() - started_clock, State.packet_state, entered_at))
+        Debug.log(('!! TIMEOUT %.2fs state=%d (started at %d) - %s'):format(
+            os.clock() - started_clock, State.packet_state, entered_at,
+            M.describe_trade_outcome()))
         return
     end
 
@@ -277,7 +305,11 @@ function M.find_porter_items(bags)
     end
 
     for _, bag_id in ipairs(bags) do
-        for _, item in ipairs(windower.ffxi.get_items(bag_id)) do
+        -- get_items returns nil for a disabled bag -- a mog wardrobe becomes one
+        -- the moment you step out of the mog house. Walking it unguarded threw
+        -- from inside whichever coroutine was scanning, and the flow died with
+        -- every operation flag still set.
+        for _, item in ipairs(windower.ffxi.get_items(bag_id) or {}) do
             if item.id ~= 0 and item.status == 0 then
                 local slip_id = SlipsLookup.get_slip_id(item.id)
 
@@ -321,8 +353,14 @@ local function each_stored_item(bitfield, contents)
     local bit_position = -1
     local option_index = 0
 
+    -- Normally 192 bits. Bounded by what actually arrived because the bitfield is
+    -- sliced out of a packet: a shorter one than expected would otherwise be read
+    -- past its end, and that throws inside the packet handler -- no reply sent,
+    -- menu stuck open.
+    local last_bit = math.min(SLIP_BITFIELD_BITS, #bitfield * 8) - 1
+
     return function()
-        while bit_position < SLIP_BITFIELD_BITS - 1 do
+        while bit_position < last_bit do
             bit_position = bit_position + 1
 
             local byte_at = math.floor(bit_position / 8) + 1
@@ -392,7 +430,9 @@ local function handle_retrieve_menu(data, update, zone_id, menu_id)
         and update:sub(UPDATE_STORED_BITS + 1, UPDATE_STORED_BITS + 24)
         or data:sub(AT.stored_bits + 1, AT.stored_bits + 24)
 
-    local resolved_bit = update and update:unpack('I', UPDATE_BIT_POS + 1)
+    local resolved_bit = update
+        and #update >= UPDATE_BIT_POS + 4
+        and update:unpack('I', UPDATE_BIT_POS + 1)
 
     for option_index, item_id, bit_position in each_stored_item(bitfield, contents) do
         if item_id and State.retrieve[item_id] and Inv.space_available(0) ~= 0 then
@@ -422,6 +462,14 @@ end
 --- Route a menu packet to whichever handler owns it. Returns false when the
 --- menu is not one of ours, leaving it untouched.
 local function dispatch_menu(data, update)
+    -- The update path feeds us a cached packet, and the cache is empty until the
+    -- client has seen one menu open -- which is exactly the case right after a
+    -- reload. Unpacking nil threw from inside the packet handler, so no answer
+    -- was sent and the menu sat at state 2 with nothing left to move it.
+    if not data or #data < AT.zone_menu + 4 then
+        return false
+    end
+
     local zone_id, menu_id = data:unpack('H2', AT.zone_menu + 1)
 
     local handler = menu_handlers[zone_id] and menu_handlers[zone_id][menu_id]
@@ -435,27 +483,85 @@ local function dispatch_menu(data, update)
         return true
     end
 
-    State.packet_state = 2
-    State.last_update  = update
-    return handler(data, update, zone_id, menu_id)
+    -- Committed before the handler runs, because a handler that closes the menu
+    -- moves the state on to 3 itself and must not be overwritten afterwards.
+    local previous_state  = State.packet_state
+    local previous_update = State.last_update
+
+    State.packet_state    = 2
+    State.last_update     = update
+    State.trade_menu_seen = true
+
+    local result = handler(data, update, zone_id, menu_id)
+
+    if result == false then
+        -- The handler wants nothing to do with this menu: the store gate was
+        -- already open, so there is no packet of ours to patch. Leaving state at
+        -- 2 for a conversation we never joined was its own failure -- the next
+        -- release read as a player cancel, and every later menu open was ignored
+        -- because that path requires state 1.
+        State.packet_state = previous_state
+        State.last_update  = previous_update
+    end
+
+    return result
+end
+
+--- Give up on the menu currently open, closing it on the way out.
+---
+--- A trade that times out used to be handled by dropping our own state back to
+--- idle and saying nothing. But a timeout does not mean nothing happened: more
+--- often the porter did open its menu, just later than we were willing to wait.
+--- Staying silent left the client inside that event, and the server answers no
+--- further trades while an event is open -- so the first timeout turned every
+--- trade after it into a timeout too. That is the loop where the addon keeps
+--- cycling slips, the moogle never answers again, and nothing short of a reload
+--- appears to help.
+---
+--- Sending the close the conversation is still waiting for is what lets the next
+--- trade be heard.
+function M.abort_menu()
+    local opened = windower.packets.last_incoming(PACKET_MENU_OPEN)
+
+    if opened and #opened >= AT.zone_menu + 4 then
+        local zone_id, menu_id = opened:unpack('H2', AT.zone_menu + 1)
+
+        -- Only close a menu that is one of ours. Anything else belongs to
+        -- whatever the player was doing and is not ours to dismiss.
+        if menu_handlers[zone_id] and menu_handlers[zone_id][menu_id] then
+            answer_menu(
+                opened:unpack('I', AT.npc_id + 1),
+                opened:unpack('H', AT.npc_index + 1),
+                zone_id, menu_id, MENU_CLOSE_OPTION, 0)
+            Debug.log(('abandoned menu %d: sent close so the event ends'):format(menu_id))
+        end
+    end
+
+    State.force_idle()
 end
 
 --- The player cancelled out of the menu. Acknowledge the close and drop every
 --- pending list so nothing half-finished carries into the next command.
 local function handle_cancel(data, release)
-    local zone_id, menu_id = data:unpack('H2', AT.zone_menu + 1)
+    if data and #data >= AT.zone_menu + 4 then
+        local zone_id, menu_id = data:unpack('H2', AT.zone_menu + 1)
 
-    if menu_id ~= release:unpack('H', 0x05 + 1) then
-        return
+        if menu_id == release:unpack('H', 0x05 + 1) then
+            answer_menu(
+                data:unpack('I', AT.npc_id + 1),
+                data:unpack('H', AT.npc_index + 1),
+                zone_id, menu_id, MENU_CLOSE_OPTION, 0)
+        else
+            -- The menu the server released is not the one we had cached, so
+            -- there is no reply we can safely send. We stand down regardless:
+            -- returning here left the machine pinned at state 2, and from that
+            -- point no menu open was ever processed again, because that path
+            -- requires state 1. Only a reload cleared it.
+            Debug.log('release names a menu we did not open - standing down')
+        end
     end
 
-    answer_menu(
-        data:unpack('I', AT.npc_id + 1),
-        data:unpack('H', AT.npc_index + 1),
-        zone_id, menu_id, MENU_CLOSE_OPTION, 0)
-
-    State.packet_state  = 0
-    State.last_update   = nil
+    State.force_idle()
     State.retrieve      = {}
     State.store         = {}
     State.storing_items = false
@@ -468,10 +574,6 @@ local function handle_menu_close(data)
         State.packet_state         = 0
         State.last_update          = nil
         State.last_trade_confirmed = true
-
-        if not State.continuous and M.on_slip_finished then
-            M.on_slip_finished()
-        end
         return
     end
 
@@ -508,25 +610,55 @@ windower.register_event('outgoing chunk', function(id, data, modified, injected)
         return
     end
 
-    -- A menu answer we did not inject is either the client closing a store
-    -- dialog we patched -- the normal way packing finishes -- or the player
-    -- clicking mid-operation. Both need the state machine moved to "closing",
-    -- but only the second is worth warning about.
+    -- A menu answer we did not inject nearly always means the client dismissed a
+    -- porter store dialog on its own, which is how packing normally finishes.
+    -- Exactly one variant is real interference, and separating them is the whole
+    -- point of this block: the old label blamed the player for all of them, at one
+    -- per trade, which sent a real investigation looking for a cause on the
+    -- player's side that was never there.
+    --
+    -- Order matters. A patched menu leaves the state at 2 as well, so the flag has
+    -- to be tested before the state.
     if State.expecting_client_close then
         State.expecting_client_close = false
-        Debug.log('store menu closed by client (expected)')
+        Debug.log('store menu closed by client (we patched it open)')
+
+    elseif State.packet_state == 2 then
+        -- We had a menu open and were answering its updates, and something else
+        -- replied to it. This one really is someone else's click.
+        Debug.log('!! 0x5B arrived while we were driving the menu (state=2) - player touched the UI')
+
     else
-        Debug.log(('!! unexpected 0x5B during op (state=%d) - player touched the UI'):format(
+        -- The store menu arrived with its gate byte already non-zero, so there was
+        -- nothing of ours to patch and handle_store_menu declined it, leaving the
+        -- state at 1. The client shows and closes its own dialog, and that close
+        -- lands here. Routine on this client: one per trade on the modern store
+        -- path, and the trade completes normally afterwards.
+        Debug.log(('store menu closed by client (gate already open, state=%d)'):format(
             State.packet_state))
     end
 
     State.packet_state = 3
 end)
 
+-- How many lines of server dialogue to keep per trade. Enough to see a refusal,
+-- short enough that a chatty zone cannot grow this without bound.
+local TRADE_TRANSCRIPT_LIMIT = 6
+
 windower.register_event('incoming text', function(original, modified, mode)
     -- Porter dialogue pauses on a "press Enter" marker. Stripping it while an
     -- operation is in flight lets the conversation advance on its own.
     local PROMPT_MODES = { [150] = true, [151] = true }
+
+    -- Record whatever the server says while a trade is in flight. This is the
+    -- only way to tell a refusal ("you cannot store that") from the server
+    -- simply not answering in time, and the two want opposite handling.
+    if State.packet_state ~= 0 and #State.trade_messages < TRADE_TRANSCRIPT_LIMIT then
+        local plain = original:gsub('[%c\128-\255]', ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if plain ~= '' then
+            State.trade_messages[#State.trade_messages + 1] = ('[%d] %s'):format(mode, plain)
+        end
+    end
 
     local operating = State.packet_state ~= 0
         or State.storing_items

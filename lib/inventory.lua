@@ -39,6 +39,13 @@ local PUT_AWAY_BACKOFF = 0.1
 local BAG_LOAD_POLLS    = 20
 local BAG_LOAD_INTERVAL = 0.25
 
+-- Pacing and settling for pulling gear into inventory ahead of a trade. Both
+-- exist because item movement is asynchronous and a trade cannot be built from a
+-- bag that is still in motion -- see M.wait_until_settled.
+local PULL_INTERVAL   = 0.05
+local SETTLE_POLLS    = 24
+local SETTLE_POLL     = 0.05
+
 -- ===========================================================================
 -- Bag inspection
 -- ===========================================================================
@@ -53,6 +60,62 @@ function M.space_available(bag_id)
         return 0
     end
     return bag.max - bag.count
+end
+
+--- Wait until inventory stops changing, so slot numbers read afterwards are the
+--- ones the server will agree with.
+---
+--- This exists because item movement is asynchronous. get_item and put_item put a
+--- packet on the wire; the client's own inventory table only catches up when the
+--- server confirms, and nothing tells us when that is. A trade built from a bag
+--- read too early carries slot numbers for items that have not landed yet -- and
+--- the server's answer to a trade with bad slots is to ignore it entirely. That
+--- surfaces as a timeout with the state machine stuck at 1, which is
+--- indistinguishable from the porter simply being slow, and it is why the same
+--- batch that "times out" during a pack stores fine on a later run: by then the
+--- gear was already in inventory and there was nothing to wait for.
+---
+--- Replaces a flat 0.15s pause, which was a guess that happened to be far too
+--- short for a burst of eight moves.
+---
+--- @param max_seconds number? cap on the wait; defaults to the poll budget
+--- @return boolean true when inventory went quiet, false if it was still moving
+function M.wait_until_settled(max_seconds)
+    local polls = max_seconds and math.floor(max_seconds / SETTLE_POLL) or SETTLE_POLLS
+
+    local function fingerprint()
+        local contents = windower.ffxi.get_items(INVENTORY)
+        if not contents then
+            return nil
+        end
+
+        -- Slot index, id and count together: a move changes at least one of them,
+        -- and reading them all is cheaper than reasoning about which changed.
+        local parts = {}
+        for index, item in ipairs(contents) do
+            parts[#parts + 1] = ('%d:%d:%d'):format(index, item.id, item.count)
+        end
+        return table.concat(parts, ',')
+    end
+
+    local previous = fingerprint()
+
+    for poll = 1, polls do
+        coroutine.sleep(SETTLE_POLL)
+
+        local current = fingerprint()
+        if current and current == previous then
+            -- Two identical reads in a row: the bag is quiet.
+            if poll > 1 then
+                Debug.log(('inventory settled after %.2fs'):format(poll * SETTLE_POLL))
+            end
+            return true
+        end
+        previous = current
+    end
+
+    Debug.log(('!! inventory still moving after %.2fs - trading anyway'):format(polls * SETTLE_POLL))
+    return false
 end
 
 --- Whether the client has finished populating the bags we are about to use.
@@ -148,7 +211,11 @@ end
 --- @return table|nil item record
 function M.find_item(bags, item_id, minimum_count)
     for _, bag_id in pairs(bags) do
-        for _, item in ipairs(windower.ffxi.get_items(bag_id)) do
+        -- A disabled bag reads back nil -- a mog wardrobe becomes one the moment
+        -- you leave the mog house. This runs once per outstanding item on every
+        -- accounting pass, so an unguarded walk here threw from the middle of a
+        -- flow and killed the coroutine with every operation flag still set.
+        for _, item in ipairs(windower.ffxi.get_items(bag_id) or {}) do
             if item.id == item_id and item.status == 0 and item.count >= minimum_count then
                 return item
             end
@@ -211,7 +278,7 @@ function M.gather_slips_from_home(only)
 
     -- Slips already in hand do not need pulling again.
     local in_hand = {}
-    for _, item in ipairs(windower.ffxi.get_items(INVENTORY)) do
+    for _, item in ipairs(windower.ffxi.get_items(INVENTORY) or {}) do
         if item.id ~= 0 and item.status == 0 and slips.items[item.id] then
             in_hand[item.id] = true
         end
@@ -291,6 +358,15 @@ end
 --- @param bags table array of destination bag ids, most preferred first
 --- @return number total stack count moved
 function M.put_away_items(items, bags)
+    -- Nothing to file away is the common case on a pack-only run, where the
+    -- retrieve list is empty by definition. Without this the retry loop below ran
+    -- its full four passes finding nothing to move, and since this is called after
+    -- every single trade it cost about 430ms per trade -- five seconds across a
+    -- one-job pack, spent entirely on scanning for items that were never queued.
+    if not items or next(items) == nil then
+        return 0
+    end
+
     local destinations = usable_bags(bags)
     if #destinations == 0 then
         return 0
@@ -311,7 +387,7 @@ function M.put_away_items(items, bags)
     for _ = 1, PUT_AWAY_PASSES do
         local moved_this_pass = 0
 
-        for index, item in ipairs(windower.ffxi.get_items(INVENTORY)) do
+        for index, item in ipairs(windower.ffxi.get_items(INVENTORY) or {}) do
             if item.status == 0 and items[item.id] then
                 for _, bag_id in ipairs(destinations) do
                     if remaining_space[bag_id] > 0 then
@@ -357,7 +433,7 @@ function M.retrieve_items(items, bags)
 
     for _, wanted in ipairs(items) do
         for _, bag_id in ipairs(sources) do
-            for index, item in ipairs(windower.ffxi.get_items(bag_id)) do
+            for index, item in ipairs(windower.ffxi.get_items(bag_id) or {}) do
                 if item.id == wanted.id and item.status == 0 then
                     if free == 0 then
                         return moved
@@ -365,6 +441,10 @@ function M.retrieve_items(items, bags)
                     free  = free - 1
                     moved = moved + item.count
                     windower.ffxi.get_item(bag_id, index, item.count)
+                    -- Paced like every other bulk move in this file. This used to
+                    -- fire the whole burst inside one frame, which is what the
+                    -- caller then had to guess a settle time for.
+                    coroutine.sleep(PULL_INTERVAL)
                 end
             end
         end

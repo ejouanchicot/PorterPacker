@@ -44,6 +44,21 @@ local RETRY_BACKOFF  = 1.0
 -- same.
 local DEADLOCK_STRIKES = 2
 
+-- An absolute ceiling on failed trades within one phase.
+--
+-- DEADLOCK_STRIKES only counts *consecutive* failures, so a single slip the
+-- porter will not take, sitting among slips it will, resets the count on every
+-- pass and never trips it -- while each of its visits costs three attempts and
+-- two backoffs. Multiplied by the pass ceiling that is half an hour of pure
+-- timeouts on one job, which is indistinguishable from a hang. A phase that has
+-- failed this many trades is not going to finish.
+--
+-- Kept low deliberately, because the trade budget is now generous: three
+-- attempts against an ~11s deadline is over half a minute of patience per slip,
+-- so four of them is already the couple of minutes past which a run stops
+-- looking slow and starts looking broken.
+local MAX_TRADE_FAILURES = 4
+
 -- Upper bounds so a slip that never resolves cannot spin forever.
 local MAX_PACK_PASSES   = 80
 local MAX_UNPACK_PASSES = 15
@@ -73,6 +88,9 @@ local SLIP_ORIGINS = {
 local function clear_pending()
     State.retrieve      = {}
     State.store         = {}
+    -- Cleared with the rest: find_porter_items reads it as an exclusion set, so
+    -- leaving it behind hides those items from the next command's scan.
+    State.original_retrieve = {}
     State.storing_items = false
 end
 
@@ -259,9 +277,19 @@ function M.step_through_slips()
     finish_stepping()
 end
 
--- Hand ourselves to the packet layer so it can chain slips without importing
--- this module (which would close an import cycle).
-Packets.on_slip_finished = M.step_through_slips
+-- Deliberately not wired to the packet layer.
+--
+-- The 0x052 handler used to call back in here whenever State.continuous was
+-- false, so each menu close injected the next trade. Two things made that
+-- ruinous: every entry point sets continuous = true, so the only way to reach it
+-- was to clear the flag mid-run -- which is precisely what //po reset does -- and
+-- once reached it is a chain the packet layer feeds itself, with no pacing, no
+-- bound, and reachable while a bulk coroutine is still trading. It sleeps inside
+-- an incoming-chunk handler on the way, too. That is the runaway only //lua
+-- unload could stop.
+--
+-- Reviving this driver means giving it its own explicit opt-in, not a flag that
+-- happens to be false.
 
 -- ===========================================================================
 -- Bulk transfer
@@ -284,6 +312,36 @@ local function describe_group(group)
     return table.concat(parts, ', ')
 end
 
+--- Did this batch's cargo actually reach the slip?
+---
+--- Asking the slip is the only direct answer. The previous test -- "a rescan finds
+--- nothing left to offer, so the silent trade must have landed" -- was not proof
+--- of anything: the batch also disappears when the slip itself gets filed home, or
+--- when a scan filter changes its mind about an item. Trusting it reported success
+--- for slips that had stored nothing, which hid the failure from the summary and
+--- let the same lot come back pass after pass.
+---
+--- @param batch table the group that was offered; index 1 is the slip itself
+--- @return boolean true only when every cargo item is on the slip
+local function cargo_landed(batch, slip_id)
+    local stored = slips.get_player_items()[slip_id]
+    if not stored then
+        return false
+    end
+
+    local on_slip = {}
+    for _, item_id in ipairs(stored) do
+        on_slip[item_id] = true
+    end
+
+    for index, item in ipairs(batch) do
+        if index > 1 and not on_slip[item.id] then
+            return false
+        end
+    end
+    return true
+end
+
 --- Find the current, tradeable batch for a slip, with slot numbers as they are
 --- right now. Returns nil when the slip has nothing left to hand over.
 local function current_batch_for(slip_id)
@@ -297,6 +355,20 @@ end
 
 --- Trade one group and wait for the server. Returns whether it went through.
 local function trade_and_wait(npc, group, slip_num, item_count)
+    -- Assert what the trade assumes, so a future log says which it was rather
+    -- than leaving us to guess from a bare timeout. The porter ignores a trade
+    -- whose slip is not in hand, and it ignores one built on stale slots; both
+    -- arrive here as a silent state-1 stall.
+    local slip = group[1]
+    local in_hand = slip and Inv.find_item({ 0 }, slip.id, 1)
+    if not in_hand then
+        Debug.log(('!! slip %d IS NOT IN INVENTORY at trade time - the porter will ignore this')
+            :format(slip_num))
+    elseif in_hand.slot ~= slip.slot then
+        Debug.log(('!! slip %d moved since the scan (slot %d -> %d) - stale batch')
+            :format(slip_num, slip.slot, in_hand.slot))
+    end
+
     Msg.progress('Packing', slip_num, item_count)
     Packets.trade_npc(npc, group)
     Packets.wait_for_trades()
@@ -305,9 +377,19 @@ local function trade_and_wait(npc, group, slip_num, item_count)
         return true
     end
 
-    Debug.log(('!! slip %d REFUSED the batch: %s'):format(slip_num, describe_group(group)))
+    -- Reported as "did not complete", not "refused". The two are different events
+    -- with opposite handling, and this log line used to assert the one it could not
+    -- know: these batches store fine on a later run, so they were never refused.
+    Debug.log(('!! slip %d trade did not complete - %s'):format(
+        slip_num, Packets.describe_trade_outcome()))
+    Debug.log(('   batch was: %s'):format(describe_group(group)))
 
-    State.packet_state = 0  -- clear the stuck state so the next trade can run
+    -- Close the conversation before moving on, rather than only clearing our own
+    -- state. A timeout usually means the menu did open, just later than we waited
+    -- for; staying silent left the client inside that event, and the server takes
+    -- no further trades until an event ends. One timeout then produced nothing but
+    -- timeouts afterwards.
+    Packets.abort_menu()
     return false
 end
 
@@ -335,11 +417,21 @@ local function trade_slip_with_retries(npc, group, slip_id, slip_num)
         if attempt > 1 then
             coroutine.sleep(RETRY_BACKOFF)
 
+            -- Ask the slip whether the attempt we just gave up on landed after
+            -- all. A slow server answering past our deadline is the common case,
+            -- and re-offering cargo the porter already took is how duplicates and
+            -- wrong-slot trades happen.
+            if cargo_landed(batch, slip_id) then
+                Debug.log(('slip %d: the silent trade landed after all - %d item(s) are on the slip')
+                    :format(slip_num, #batch - 1))
+                return true, #batch - 1
+            end
+
             batch = current_batch_for(slip_id)
             if not batch then
-                Debug.log(('slip %d has nothing left to hand over - the silent trade landed')
+                Debug.log(('slip %d: nothing left to offer, yet its cargo never reached the slip')
                     :format(slip_num))
-                return true, 0
+                return false, 0
             end
 
             npc = require_porter()
@@ -367,13 +459,22 @@ end
 ---
 --- @return number items packed
 --- @return number slips packed
-local function run_pack_phase(npc, origins)
+local function run_pack_phase(npc, origins, token)
     local packed_items, packed_slips = 0, 0
     local strikes = 0
+    local failures = 0
     local pass = 1
     local progressed = true
+    local previous_cargo = -1
 
     while progressed and pass <= MAX_PACK_PASSES do
+        -- Someone reset the addon, zoned, or started something else. Stopping
+        -- here is what makes //po reset able to end a run in flight.
+        if State.superseded(token) then
+            Debug.log('PACK abandoned: this operation no longer owns the addon')
+            return packed_items, packed_slips, true
+        end
+
         progressed = false
 
         -- Re-read the bags at the start of every pass rather than working from
@@ -387,6 +488,27 @@ local function run_pack_phase(npc, origins)
         -- that was already home. The rescan costs about five milliseconds and
         -- gives the loop an accurate view of what is left.
         local groups = Packets.find_porter_items(Config.equippable_bags)
+
+        -- How much cargo is still waiting to be handed over. `progressed` cannot
+        -- answer that question: it is set from the trade having completed, and a
+        -- trade completes -- state back to idle, counted as a success -- whether
+        -- or not the items actually left the bags. When they did not, every pass
+        -- found the same groups and re-ran the same pull/rescan/trade/file cycle
+        -- over them, for as many passes as the ceiling allowed, storing nothing
+        -- and looking exactly like a hang. A pass that leaves the bags holding
+        -- precisely what they held before has nothing left to try.
+        local cargo = 0
+        for slip_id, group in pairs(groups) do
+            if is_tradeable(group, slip_id) then
+                cargo = cargo + #group - 1
+            end
+        end
+
+        if cargo == previous_cargo then
+            Debug.log(('PACK stopped: pass %d left %d item(s) unmoved'):format(pass, cargo))
+            break
+        end
+        previous_cargo = cargo
 
         for slip_id, group in pairs(groups) do
             if is_tradeable(group, slip_id) then
@@ -405,7 +527,17 @@ local function run_pack_phase(npc, origins)
                     local stop = Debug.stopwatch('pack:pull-slip-cargo')
                     local pulled = Inv.retrieve_items(group, Config.equippable_bags)
                     stop(('%d of %d item(s)'):format(pulled, #group))
-                    coroutine.sleep(PAUSE_AFTER_GATHER)
+
+                    -- Wait for the bag to actually go quiet rather than guessing.
+                    -- The rescan below captures slot numbers straight into a trade
+                    -- packet, and slots read while items are still in flight are
+                    -- slots the server disagrees with -- it answers such a trade by
+                    -- ignoring it, which looked exactly like the porter stalling.
+                    if pulled > 0 then
+                        Inv.wait_until_settled()
+                    else
+                        coroutine.sleep(PAUSE_AFTER_GATHER)
+                    end
                 end
 
                 local stop_scan = Debug.stopwatch('pack:rescan-inventory')
@@ -429,13 +561,13 @@ local function run_pack_phase(npc, origins)
                         end
 
                         if traded then
-                            strikes = 0
-                            progressed = true
-
                             -- Keep inventory clear for the trades that follow.
                             local stop_flush = Debug.stopwatch('pack:flush-inventory')
                             Inv.put_away_items(State.original_retrieve, Config.bag_priority)
                             stop_flush()
+
+                            strikes    = 0
+                            progressed = true
 
                             if item_count > 0 then
                                 Msg.stored(item_count, slip_num)
@@ -443,14 +575,16 @@ local function run_pack_phase(npc, origins)
                                 packed_slips = packed_slips + 1
                             end
                         else
-                            strikes = strikes + 1
-                            Debug.log(('PACK trade TIMEOUT slip=%d (consec=%d)'):format(
-                                slip_num, strikes))
+                            strikes  = strikes + 1
+                            failures = failures + 1
+                            Debug.log(('PACK trade TIMEOUT slip=%d (consec=%d, total=%d)'):format(
+                                slip_num, strikes, failures))
                             Msg.warning(('Slip %d trade timed out (network deadlock?) - skipping')
                                 :format(slip_num))
 
-                            if strikes >= DEADLOCK_STRIKES then
-                                Debug.log('PACK aborted: 2 consecutive timeouts')
+                            if strikes >= DEADLOCK_STRIKES or failures >= MAX_TRADE_FAILURES then
+                                Debug.log(('PACK stopped: %d consecutive, %d total failed trade(s)')
+                                    :format(strikes, failures))
                                 progressed = false
                                 break
                             end
@@ -458,7 +592,7 @@ local function run_pack_phase(npc, origins)
                     end
                 end
 
-                if strikes >= DEADLOCK_STRIKES then
+                if strikes >= DEADLOCK_STRIKES or failures >= MAX_TRADE_FAILURES then
                     break
                 end
 
@@ -510,7 +644,7 @@ local function unpack_one_slip(npc, slip_id)
 
     local stalled = State.packet_state ~= 0
     if stalled then
-        State.packet_state = 0
+        Packets.abort_menu()  -- end the event, not just our own bookkeeping
     end
 
     -- A slip can return several items in one go, so count what actually landed
@@ -541,7 +675,7 @@ end
 ---
 --- @return number items retrieved
 --- @return number slips visited
-local function run_unpack_phase(npc, origins)
+local function run_unpack_phase(npc, origins, token)
     if table.length(State.retrieve) == 0 or Inv.space_available(0) == 0 then
         return 0, 0
     end
@@ -557,9 +691,20 @@ local function run_unpack_phase(npc, origins)
 
     local retrieved_items, visited_slips = 0, 0
     local previous_outstanding = -1
+    local failures = 0
     local pass = 1
 
     while table.length(State.retrieve) > 0 and pass < MAX_UNPACK_PASSES do
+        if State.superseded(token) then
+            Debug.log('UNPACK abandoned: this operation no longer owns the addon')
+            return retrieved_items, visited_slips, true
+        end
+
+        if failures >= MAX_TRADE_FAILURES then
+            Debug.log(('UNPACK stopped: %d failed trade(s) in this phase'):format(failures))
+            break
+        end
+
         -- Make room before walking the slips: a pass that starts with a full
         -- inventory retrieves nothing and would trip the no-progress exit.
         local stop_flush = Debug.stopwatch('unpack:flush-before-pass')
@@ -603,9 +748,10 @@ local function run_unpack_phase(npc, origins)
                             used = true
 
                             if stalled and recovered == 0 then
-                                strikes = strikes + 1
-                                Debug.log(('UNPACK slip=%d FAILED (timeout, 0 items) - fails=%d')
-                                    :format(slips.get_slip_number_by_id(slip_id), strikes))
+                                strikes  = strikes + 1
+                                failures = failures + 1
+                                Debug.log(('UNPACK slip=%d FAILED (timeout, 0 items) - consec=%d, total=%d')
+                                    :format(slips.get_slip_number_by_id(slip_id), strikes, failures))
                                 break  -- stop hammering a slip that is not answering
                             end
 
@@ -635,9 +781,46 @@ local function run_unpack_phase(npc, origins)
 end
 
 --- Run a full pack and/or unpack in one sequential sweep.
-function M.run_bulk_transfer()
+--- @param token number ownership token from State.begin_operation
+function M.run_bulk_transfer(token)
+    --- Wrap up, whichever way we got here -- including the aborts.
+    ---
+    --- The unconditional part matters most for original_retrieve. It doubles as
+    --- an exclusion set in find_porter_items, so an abort that left it populated
+    --- silently hid exactly the gear the *next* command was asked to put away.
+    --- That is the shape of "it runs and stores nothing": the pre-scan sees an
+    --- empty world and the trade loop disagrees, because the two are reading
+    --- different state.
+    local function finish(packed_items, packed_slips, retrieved_items, retrieved_slips)
+        -- Being superseded means another operation owns State now. Clearing its
+        -- lists or moving items on its behalf is the concurrency bug, not the fix.
+        if State.superseded(token) then
+            Debug.log('flow ended superseded - leaving state to whoever owns it now')
+            return
+        end
+
+        Inv.put_away_items(State.original_retrieve, Config.bag_priority)
+
+        State.store             = {}
+        State.storing_items     = false
+        State.retrieve          = {}
+        State.original_retrieve = {}
+
+        if packed_slips > 0 then
+            Msg.summary('Packed', packed_items, packed_slips)
+        end
+        if retrieved_slips > 0 then
+            Msg.summary('Retrieved', retrieved_items, retrieved_slips)
+        end
+
+        -- Bulk mode reads these to decide whether a job made any progress at all.
+        State.async_total_items = packed_items + retrieved_items
+        State.async_total_slips = packed_slips + retrieved_slips
+    end
+
     local npc = require_porter()
     if not npc then
+        finish(0, 0, 0, 0)
         return
     end
 
@@ -654,8 +837,9 @@ function M.run_bulk_transfer()
     if State.storing_items then
         local aborted
         packed_items, packed_slips, aborted =
-            run_pack_phase(npc, origins)
+            run_pack_phase(npc, origins, token)
         if aborted then
+            finish(packed_items, packed_slips, 0, 0)
             return
         end
     end
@@ -663,24 +847,13 @@ function M.run_bulk_transfer()
     State.store         = {}
     State.storing_items = false
 
-    local retrieved_items, retrieved_slips, aborted = run_unpack_phase(npc, origins)
+    local retrieved_items, retrieved_slips, aborted = run_unpack_phase(npc, origins, token)
     if aborted then
+        finish(packed_items, packed_slips, retrieved_items, retrieved_slips)
         return
     end
 
-    Inv.put_away_items(State.original_retrieve, Config.bag_priority)
-    State.retrieve = {}
-
-    if packed_slips > 0 then
-        Msg.summary('Packed', packed_items, packed_slips)
-    end
-    if retrieved_slips > 0 then
-        Msg.summary('Retrieved', retrieved_items, retrieved_slips)
-    end
-
-    -- Bulk mode reads these to decide whether a job made any progress at all.
-    State.async_total_items = packed_items + retrieved_items
-    State.async_total_slips = packed_slips + retrieved_slips
+    finish(packed_items, packed_slips, retrieved_items, retrieved_slips)
 end
 
 -- Names used before the flow rewrite; kept so callers elsewhere keep working.

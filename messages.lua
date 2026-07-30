@@ -126,6 +126,17 @@ function Messages.completed()
         C.gray .. ' (' .. C.pale_yellow .. 'idle' .. C.gray .. ')')
 end
 
+--- Refusal when another command is still running. Distinct from busy(): that one
+--- is a momentary packet-state clash worth retrying, this one means a whole
+--- operation owns the addon and will for as long as it takes.
+function Messages.already_running()
+    local C = Chat.C
+    Chat.send(Chat.tag() .. C.orange .. 'Already running:' .. C.white ..
+        ' an operation is in progress' ..
+        C.gray .. ' - let it finish, or ' .. C.cyan .. '//po reset' ..
+        C.gray .. ' to stop it')
+end
+
 --- Busy guard message.
 function Messages.busy(state_num, status_num)
     local C = Chat.C
