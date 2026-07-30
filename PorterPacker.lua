@@ -37,6 +37,7 @@ local Debug = require('lib/debug')
 local Inv = require('lib/inventory')
 local Packets = require('lib/packets')
 local Flow = require('lib/flow')
+local Naked = require('lib/naked')
 local SlipsLookup = require('lib/slips_lookup')
 
 ---============================================================================
@@ -899,14 +900,27 @@ end
 --- across a pcall boundary is not portable on this runtime. If an action does
 --- throw, the lock stays held and //po reset releases it -- reset_all clears
 --- operation_active as well as bumping the generation.
-local function run_exclusive(action)
+--- @param strip_gear boolean? undress before the action and hand the slots back
+---        after. Every pack/unpack path wants this: find_porter_items only sees
+---        items with status 0, which equipped gear does not have, so a job's own
+---        set -- the gear most likely to be worn when you ask for it to be packed
+---        -- was invisible to every scan.
+local function run_exclusive(action, strip_gear)
     local token = State.begin_operation()
     if not token then
         Msg.already_running()
         return
     end
 
+    if strip_gear then
+        Naked.strip()
+    end
+
     action(token)
+
+    if strip_gear then
+        Naked.release()
+    end
 
     State.end_operation(token)
 end
@@ -919,6 +933,9 @@ windower.register_event('zone change', function()
     if State.operation_active or State.packet_state ~= 0 then
         Msg.warning('Zoned mid-operation - PorterPacker stopped and reset.')
         Debug.log('zone change during an operation - reset')
+        -- The slots were locked for the run that just got cut short. Leaving a
+        -- player unable to change gear is the worst way for this addon to fail.
+        Naked.release()
     end
     State.reset_all()
 end)
@@ -961,7 +978,7 @@ windower.register_event(
             end
             run_exclusive(function(token)
                 single_job_op('swap', player.main_job, player, token)
-            end)
+            end, true)
             return
         end
 
@@ -1003,8 +1020,13 @@ windower.register_event(
                 Packets.abort_menu()
             end
 
+            -- Unconditional, and the reason this command is the recovery path: an
+            -- operation that died without reaching its own release left the gear
+            -- slots locked. `gs enable all` is harmless when nothing is locked.
+            Naked.release()
+
             State.reset_all()
-            Msg.success('State machine reset - any run in progress will stop')
+            Msg.success('State machine reset - slots released, any run in progress will stop')
             return
         end
 
@@ -1042,7 +1064,7 @@ windower.register_event(
         if cmd == 'all' or cmd == 'packall' then
             run_exclusive(function(token)
                 bulk_op(true, player, nil, nil, nil, nil, token) -- mode=nil => Active + Inactive
-            end)
+            end, true)
             return
         end
 
@@ -1051,7 +1073,7 @@ windower.register_event(
             local scope = (arg == 'inactive' or arg == 'i') and 'inactive' or 'active'
             run_exclusive(function(token)
                 bulk_op(false, player, nil, scope, nil, nil, token)
-            end)
+            end, true)
             return
         end
 
@@ -1060,7 +1082,7 @@ windower.register_event(
             local target = (arg and arg:upper()) or player.main_job
             run_exclusive(function(token)
                 single_job_op('unpack', target, player, token)
-            end)
+            end, true)
             return
         end
 
@@ -1069,7 +1091,7 @@ windower.register_event(
             local target = (arg and arg:upper()) or player.main_job
             run_exclusive(function(token)
                 single_job_op('pack', target, player, token)
-            end)
+            end, true)
             return
         end
 
@@ -1079,14 +1101,14 @@ windower.register_event(
             local target = (arg and arg:upper()) or player.main_job
             run_exclusive(function(token)
                 single_job_op('swap', target, player, token)
-            end)
+            end, true)
             return
         end
         if Config.VALID_JOBS[cmd:upper()] then
             local target = cmd:upper()
             run_exclusive(function(token)
                 single_job_op('swap', target, player, token)
-            end)
+            end, true)
             return
         end
 
