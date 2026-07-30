@@ -36,6 +36,13 @@ You need:
 The `slips` and `resources` libraries the addon depends on ship with Windower,
 so there is nothing extra to download.
 
+**Expect to end up naked.** Every pack or unpack command undresses you first, and
+that is not optional: the Porter Moogle cannot take a piece you are wearing, so
+gear left equipped is gear the addon cannot see. If GearSwap is loaded it is used
+to do the undressing and its slots are locked for the duration, then released when
+the run finishes. Should a run ever die halfway and leave you unable to change
+gear, `//po reset` hands the slots back.
+
 ---
 
 ## Installation
@@ -43,7 +50,7 @@ so there is nothing extra to download.
 ### The easy way — download the release
 
 1. Go to the [latest release](https://github.com/ejouanchicot/PorterPacker/releases/latest).
-2. Download `PorterPacker-2.0.0.zip`.
+2. Download `PorterPacker-2.1.0.zip`.
 3. Extract it into your Windower addons folder.
 
 You should end up with this — the folder must be named `PorterPacker`:
@@ -348,6 +355,14 @@ Your gear lists don't exist yet. See
 **"Network deadlock detected"**
 The FFXI client's packet queue is jammed. Zone to a different area to clear it,
 then retry.
+
+**"Already running: an operation is in progress"**
+A previous command is still working — a full `//po all` takes minutes. Let it
+finish, or stop it with `//po reset`.
+
+**I can't change gear after a run**
+A run that died partway can leave GearSwap's slots locked. `//po reset` releases
+them.
 
 **It stopped partway through**
 Run `//po reset`, then `//po slips` to return any slips left loose in your

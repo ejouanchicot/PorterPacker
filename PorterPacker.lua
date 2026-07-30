@@ -1,6 +1,6 @@
 _addon.name = 'PorterPacker'
 _addon.author = 'ejouanchicot (refactor); orig. Ivaar, mods Gimlic & Siyual'
-_addon.version = '2.0.0'
+_addon.version = '2.1.0'
 _addon.commands = {'porterpacker', 'packer', 'po'}
 
 ---============================================================================
