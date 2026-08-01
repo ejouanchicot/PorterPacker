@@ -50,7 +50,7 @@ gear, `//po reset` hands the slots back.
 ### The easy way — download the release
 
 1. Go to the [latest release](https://github.com/ejouanchicot/PorterPacker/releases/latest).
-2. Download `PorterPacker-2.1.0.zip`.
+2. Download `PorterPacker-2.1.1.zip`.
 3. Extract it into your Windower addons folder.
 
 You should end up with this — the folder must be named `PorterPacker`:
