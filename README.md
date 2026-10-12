@@ -290,6 +290,18 @@ All three prefixes do the same thing: `//porterpacker`, `//packer`, `//po`.
 For `//po s`, `scope` can be `active` (the default), `inactive`, `all`, or a job
 code like `WAR`.
 
+### Chaining a command
+
+Add `then` and a Windower command to any pack or unpack command, and it runs
+once that run has finished:
+
+```
+//po then gs c wo
+//po WAR then input /echo gear is out
+```
+
+Nothing follows a run that was reset or cut short by zoning.
+
 ### Utilities
 
 | Command | Effect |
@@ -299,7 +311,7 @@ code like `WAR`.
 | `//po slips` or `//po rs` | Put stray slips back in your satchel |
 | `//po export [name]` | Export storable inventory to `data/<name>.lua` |
 | `//po export all` | Export every bag, one file each |
-| `//po debug on` / `off` | Write packet logs to `debug.log` |
+| `//po debug on` / `off` | Write packet logs to `debug_<charname>.log` |
 
 ---
 
@@ -368,9 +380,15 @@ them.
 Run `//po reset`, then `//po slips` to return any slips left loose in your
 inventory. Then try again.
 
+**"N storage slip(s) stayed in inventory: your satchel is full"**
+The addon had slips to put away and nowhere to put them. Free some slots in the
+bag your slips live in, then run `//po slips`. If your slips actually live
+somewhere other than the satchel, set `slip_home_bag` in
+`data/YourCharacterName/config.lua` — see [Configuration](#configuration).
+
 **Still broken**
 Turn on logging with `//po debug on`, reproduce the problem, and check
-`debug.log` in the addon folder — or open an
+`debug_<YourCharacterName>.log` in the addon folder — or open an
 [issue](https://github.com/ejouanchicot/PorterPacker/issues) and include it.
 
 ---

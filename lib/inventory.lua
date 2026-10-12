@@ -314,9 +314,18 @@ end
 --- another attempt, which is cheaper than pacing the first pass slowly enough
 --- to never drop anything.
 ---
---- @return number slips moved across all passes
+--- Always re-reads inventory at the end and reports what is still sitting there.
+--- A home bag with no room left is the ordinary way this fails, and it used to
+--- fail in silence: the caller printed how many slips went home and nothing at
+--- all about the ones that stayed, so a run that filed none of them looked
+--- exactly like a run that had none to file.
+---
+--- @return number moved    slips moved across all passes
+--- @return number stranded slips still in inventory afterwards
+--- @return boolean blocked true when the home bag ran out of room
 function M.return_slips_to_home()
-    local total = 0
+    local total   = 0
+    local blocked = false
 
     for pass = 1, RETURN_PASSES do
         local queue = slip_positions(INVENTORY)
@@ -329,8 +338,10 @@ function M.return_slips_to_home()
         local sent = 0
         for _, slip in ipairs(queue) do
             if M.space_available(Config.SLIP_HOME_BAG) <= 0 then
-                Debug.log(('!! return satchel full at %d/%d'):format(sent, #queue))
-                return total + sent
+                Debug.log(('!! return home bag %d full at %d/%d'):format(
+                    Config.SLIP_HOME_BAG, sent, #queue))
+                blocked = true
+                break
             end
             windower.ffxi.put_item(Config.SLIP_HOME_BAG, slip.index, slip.count)
             sent = sent + 1
@@ -338,10 +349,21 @@ function M.return_slips_to_home()
         end
 
         total = total + sent
-        coroutine.sleep(SETTLE_INTERVAL)  -- settle before the verification re-read
+        if sent > 0 then
+            coroutine.sleep(SETTLE_INTERVAL)  -- settle before the verification re-read
+        end
+        if blocked then
+            break
+        end
     end
 
-    return total
+    local stranded = #slip_positions(INVENTORY)
+    if stranded > 0 then
+        Debug.log(('!! return_slips left %d slip(s) in inv (home=%d, blocked=%s)'):format(
+            stranded, Config.SLIP_HOME_BAG, tostring(blocked)))
+    end
+
+    return total, stranded, blocked
 end
 
 -- ===========================================================================

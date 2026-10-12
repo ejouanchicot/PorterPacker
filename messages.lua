@@ -225,6 +225,7 @@ function Messages.show_help()
     Chat.cmd_row('//po fetch',           'UNPACK ALL Active jobs')
     Chat.cmd_row('//po fetch inactive',  'UNPACK ALL Inactive jobs')
     Chat.cmd_row('//po s [scope]',       'STATUS: see what is stored vs out')
+    Chat.cmd_row('... then <command>',   'Run a command when the run has finished')
     Chat.blank()
 
     Chat.section('STATUS SCOPES')

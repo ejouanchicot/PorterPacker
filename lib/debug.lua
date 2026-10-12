@@ -1,7 +1,8 @@
 ---============================================================================
 --- PorterPacker / lib/debug.lua
 ---============================================================================
---- Debug logger: writes to <addon>/debug.log when State.debug_enabled is true.
+--- Debug logger: writes to <addon>/debug_<charname>.log when State.debug_enabled
+--- is true.
 --- No-op (zero overhead) when debug is off.
 ---
 --- Convention: lines starting with `!!` are anomalies/errors. Use them when
@@ -12,13 +13,33 @@ local State = require('lib/state')
 
 local M = {}
 
-M.log_path = windower.addon_path .. 'debug.log'
+--- Where this character's log lives.
+---
+--- Per-character, because every FFXI client runs its own copy of the addon and
+--- they all used to append to one `debug.log`. Two characters swapping at the
+--- same Moogle interleaved their lines into a single file with nothing naming
+--- the writer, and `//po debug on` on one of them truncated the other's log
+--- mid-run.
+---
+--- Resolved on each call rather than cached at load: the addon is loaded before
+--- the player exists, so a path computed once here would stay the nameless
+--- fallback for the whole session.
+---
+--- @return string
+function M.path()
+    local player = windower.ffxi.get_player()
+    local name = player and player.name
+    if not name or name == '' then
+        return windower.addon_path .. 'debug.log'
+    end
+    return windower.addon_path .. 'debug_' .. name .. '.log'
+end
 
 --- Append a single line with timestamp.
 --- @param line string Log content
 function M.log(line)
     if not State.debug_enabled then return end
-    local f = io.open(M.log_path, 'a')
+    local f = io.open(M.path(), 'a')
     if f then
         f:write(os.date('[%H:%M:%S] ') .. line .. '\n')
         f:close()
@@ -49,9 +70,10 @@ function M.stopwatch(label)
     end
 end
 
---- Truncate the log file. Called when debug is enabled to start fresh.
+--- Truncate this character's log file. Called when debug is enabled to start
+--- fresh. It only ever opens M.path(), so it cannot wipe another client's log.
 function M.clear()
-    local f = io.open(M.log_path, 'w')
+    local f = io.open(M.path(), 'w')
     if f then f:close() end
 end
 

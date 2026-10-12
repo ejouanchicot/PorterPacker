@@ -337,6 +337,56 @@ local function await_item_data()
     Msg.warning('Item data still loading - results may be incomplete. Retry in a moment if so.')
 end
 
+-- Bag names for the slip messages. Anything not listed is reported by id,
+-- which is enough to point at the right config line.
+local BAG_NAMES = {
+    [0] = 'inventory', [5] = 'satchel', [6] = 'sack', [7] = 'case',
+    [8] = 'wardrobe 1', [10] = 'wardrobe 2', [11] = 'wardrobe 3', [12] = 'wardrobe 4',
+    [13] = 'wardrobe 5', [14] = 'wardrobe 6', [15] = 'wardrobe 7', [16] = 'wardrobe 8',
+}
+
+local function bag_label(bag_id)
+    return BAG_NAMES[bag_id] or ('bag ' .. tostring(bag_id))
+end
+
+--- File every slip in inventory back in its home bag, and report both halves
+--- of the outcome.
+---
+--- The reporting is the point. Returning slips used to be announced only when
+--- at least one moved, so the two failures that actually happen -- a home bag
+--- with no room, and a run that aborted before it ever got here -- both looked
+--- identical to having nothing to do, and the slips stayed in inventory with
+--- nothing said about them.
+---
+--- @param context string label for the debug log
+--- @return number returned
+--- @return number stranded
+local function stow_slips(context)
+    local returned, stranded, blocked = Inv.return_slips_to_home()
+    local home = bag_label(Config.SLIP_HOME_BAG)
+
+    Debug.log(('stow_slips [%s]: %d returned, %d stranded, blocked=%s, inv_free=%d'):format(
+        context, returned, stranded, tostring(blocked), Inv.space_available(0)))
+
+    if returned > 0 then
+        Msg.info(('Returned %d storage slip(s) to %s'):format(returned, home))
+    end
+
+    if stranded > 0 then
+        if blocked then
+            Msg.warning(('%d storage slip(s) stayed in inventory: your %s is full.'):format(
+                stranded, home))
+            Msg.warning(('Free space there, or point slip_home_bag at another bag in ' ..
+                'data/<char>/config.lua, then run //po slips.'))
+        else
+            Msg.warning(('%d storage slip(s) stayed in inventory - run //po slips to file them.')
+                :format(stranded))
+        end
+    end
+
+    return returned, stranded
+end
+
 --- Bring in the slips an operation needs, and say precisely what is missing
 --- when inventory cannot hold them.
 --- @param wanted table|nil set of slip ids, or nil to fetch every slip
@@ -353,11 +403,17 @@ local function gather_needed_slips(wanted, context)
         Msg.error(('Free %d more inventory slot(s), then run the command again.'):format(needed))
         Debug.log(('ABORT [%s]: missing %d slots, %d of %d slips ungathered'):format(
             context, needed, left_behind, pending))
-        return false, gathered
+        -- Hand back what we did pull. Aborting with them still in hand told the
+        -- user to free inventory slots that the stranded slips were themselves
+        -- occupying, and on a swap those slips include everything the pack phase
+        -- had deliberately left in inventory for this step to reuse.
+        stow_slips('gather-abort:' .. context)
+        return false, 0
     end
 
     if gathered > 0 then
-        Msg.info(('Gathered %d storage slip(s) from satchel'):format(gathered))
+        Msg.info(('Gathered %d storage slip(s) from %s'):format(
+            gathered, bag_label(Config.SLIP_HOME_BAG)))
     end
     return true, gathered
 end
@@ -648,12 +704,8 @@ local function bulk_op(is_pack, player, skip_job, mode, defer_slip_return, exclu
     if defer_slip_return then
         Debug.log('Slip return deferred to caller (swap mode)')
     else
-        Debug.log('--- Post-return slips to satchel ---')
-        local returned = Inv.return_slips_to_home()
-        Debug.log(('return_slips_to_home: %d slips, inv_free=%d'):format(returned, Inv.space_available(0)))
-        if returned > 0 then
-            Msg.info(('Returned %d storage slip(s) to satchel'):format(returned))
-        end
+        Debug.log('--- Post-return slips home ---')
+        stow_slips('bulk-end')
     end
 
     Debug.log(
@@ -825,10 +877,7 @@ local function single_job_op(mode, target, player, token)
         return  -- another operation owns the bags now; do not move its slips
     end
 
-    local returned = Inv.return_slips_to_home()
-    if returned > 0 then
-        Msg.info(('Returned %d storage slip(s) to satchel'):format(returned))
-    end
+    stow_slips('single-job-end')
     Msg.completed()
 end
 
@@ -905,7 +954,16 @@ end
 ---        items with status 0, which equipped gear does not have, so a job's own
 ---        set -- the gear most likely to be worn when you ask for it to be packed
 ---        -- was invisible to every scan.
+--- The Windower command typed after `then` (`//po then gs c wo`), run once
+--- when the pack/unpack run it came with has finished. Nil without one.
+local after_run = nil
+
 local function run_exclusive(action, strip_gear)
+    -- Taken here, before anything can fail: a `then` typed with a command that
+    -- is refused must not be left behind for the next run to fire.
+    local after = after_run
+    after_run = nil
+
     local token = State.begin_operation()
     if not token then
         Msg.already_running()
@@ -918,11 +976,34 @@ local function run_exclusive(action, strip_gear)
 
     action(token)
 
+    -- Whatever the action managed or gave up on, the slips it pulled into
+    -- inventory are ours to put away, and this is the only point every path
+    -- passes through. The pack and unpack flows each end with their own stow,
+    -- but every early return inside them skipped it -- an aborted swap in
+    -- particular, which defers the pack phase's return to an unpack phase that
+    -- never ran, left the whole handful loose in inventory with nothing said.
+    -- Cheap when there is nothing to do: one inventory scan.
+    --
+    -- strip_gear marks exactly the commands that move gear and slips around;
+    -- the read-only ones neither gather slips nor need this.
+    if strip_gear and not State.superseded(token) then
+        stow_slips('run-exclusive')
+    end
+
     if strip_gear then
         Naked.release()
     end
 
+    -- `//po ... then <command>`: only for a run that reached its end. One that
+    -- was reset or cut by a zone change stops here, and so does what was to
+    -- follow it. A second later, so the slots handed back just above are free
+    -- by the time the next command wants them.
+    local finished = not State.superseded(token)
     State.end_operation(token)
+    if after and finished then
+        Debug.log(('run finished - then: %s'):format(after))
+        coroutine.schedule(function() windower.send_command(after) end, 1)
+    end
 end
 
 -- Zoning or logging out mid-operation used to leave every flag exactly as it
@@ -961,6 +1042,18 @@ windower.register_event(
         -- swap performs (target unpack + per-job pack lists + target unpack
         -- again), eliminating the expensive res.items re-scans.
         load_file_cache = {}
+        -- `then <command>`: everything after the word is a Windower command for
+        -- the end of the run, and is not part of this one.
+        after_run = nil
+        for i, word in ipairs(commands) do
+            if word:lower() == 'then' then
+                local rest = {}
+                for j = i + 1, #commands do rest[#rest + 1] = commands[j] end
+                for j = #commands, i, -1 do commands[j] = nil end
+                if #rest > 0 then after_run = table.concat(rest, ' ') end
+                break
+            end
+        end
         local cmd = commands[1] and commands[1]:lower() or nil
         local arg = commands[2] and commands[2]:lower() or nil
 
@@ -987,14 +1080,20 @@ windower.register_event(
             if arg == 'on' or arg == '1' or arg == 'enable' then
                 Debug.clear()
                 State.debug_enabled = true
-                Debug.log('===== Debug session started =====')
-                Msg.success('Debug logging ENABLED -> ' .. Msg.C.cyan .. Debug.log_path)
+                -- Stamp who is writing. The log is per-character now, but a file
+                -- that names its author needs no cross-referencing when two of
+                -- them turn up in the same bug report.
+                Debug.log(('===== Debug session started - %s (%s%s) ====='):format(
+                    player.name,
+                    player.main_job or '?',
+                    player.sub_job and ('/' .. player.sub_job) or ''))
+                Msg.success('Debug logging ENABLED -> ' .. Msg.C.cyan .. Debug.path())
             elseif arg == 'off' or arg == '0' or arg == 'disable' then
                 State.debug_enabled = false
                 Msg.notice('Debug logging DISABLED')
             else
                 Msg.notice('Usage: //po debug on | off')
-                Msg.notice('Log file: ' .. Debug.log_path)
+                Msg.notice('Log file: ' .. Debug.path())
             end
             return
         end
@@ -1044,10 +1143,8 @@ windower.register_event(
             -- sit above the guard, so it could be run mid-operation and file the
             -- slips away while a pack loop was still trading them.
             run_exclusive(function()
-                local returned = Inv.return_slips_to_home()
-                if returned > 0 then
-                    Msg.success(('Returned %d storage slip(s) to satchel'):format(returned))
-                else
+                local returned, stranded = stow_slips('manual')
+                if returned == 0 and stranded == 0 then
                     Msg.notice('No storage slips in inventory to return.')
                 end
             end)
