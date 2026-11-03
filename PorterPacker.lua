@@ -1,6 +1,6 @@
 _addon.name = 'PorterPacker'
 _addon.author = 'ejouanchicot (refactor); orig. Ivaar, mods Gimlic & Siyual'
-_addon.version = '2.2.0'
+_addon.version = '2.2.1'
 _addon.commands = {'porterpacker', 'packer', 'po'}
 
 ---============================================================================
@@ -786,8 +786,8 @@ local function single_job_op(mode, target, player, token)
 
     -- Swap = pack everything else first, then unpack the target.
     if is_swap then
-        Msg.action('AUTO PACK ALL', 'before unpacking ' .. target_upper .. ' (skip ' .. target_upper .. ')', true)
-        Debug.log(('===== AUTO PACK ALL before unpack %s (skip %s) ====='):format(target_upper, target_upper))
+        Msg.action('AUTO PACK ALL', 'before unpacking ' .. target_upper, true)
+        Debug.log(('===== AUTO PACK ALL before unpack %s ====='):format(target_upper))
         -- Pre-load the target's UNPACK list and pass it as an exclusion set
         -- to the pack phase. Items destined for unpack (e.g. Naegling shared
         -- across every job's pack list) stay in inv through the pack phase
@@ -799,9 +799,15 @@ local function single_job_op(mode, target, player, token)
             for _ in pairs(target_unpack_ids) do n = n + 1 end
             Debug.log(('PACK exclusion set: %d items from %s.unpack will stay in inv'):format(n, target_upper))
         end
+        -- The target's own pack list runs too, less its unpack list (the
+        -- exclusion set above): a piece only the target's pack list holds,
+        -- taken out of its unpack list since the last swap, went back to the
+        -- Porter Moogle only when leaving that job. Without an unpack list
+        -- there is no exclusion set, so the target is skipped as before.
         -- mode=nil = full job list. defer_slip_return=true so slips stay in
         -- inv for the upcoming unpack phase (saves a return + re-gather cycle).
-        bulk_op(true, player, target_upper, nil, true, target_unpack_ids, token)
+        local skip = (not target_unpack_ids) and target_upper or nil
+        bulk_op(true, player, skip, nil, true, target_unpack_ids, token)
 
         if State.superseded(token) then
             Debug.log('SWAP abandoned after the pack phase: no longer owns the addon')
