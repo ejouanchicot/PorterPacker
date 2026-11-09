@@ -1,13 +1,17 @@
 ---  ═══════════════════════════════════════════════════════════════════════════
 ---   PorterPacker - Low-level Chat Helpers
 ---  ═══════════════════════════════════════════════════════════════════════════
----   FFXI-chat formatting primitives following the same style as the
----   GearSwap wardrobe_organizer/lib/chat.lua (separator '=' x 74,
----   [PorterPacker] tag, inline color codes via 0x1F).
+---   FFXI-chat formatting primitives in the GearSwap Tetsouo style
+---   ([PorterPacker] tag, inline color codes via 0x1F). The separator lines
+---   follow the character's GearSwap chat options when there are any
+---   (GearSwap/data/<Name>/_common/display/UI_CONFIG.lua, UIConfig.chat:
+---   separators on / off, separator_char, width, separator_color: what
+---   //gs c ui separators / sepchar / chatwidth / sepcolor set), so PorterPacker's
+---   lines are as wide as GearSwap's; else 69 '=' in gray, GearSwap's standard.
 ---
 ---   Public functions:
----     Chat.separator()                  - 74-char gray rule
----     Chat.divider()                    - 74-char gray '-' rule
+---     Chat.separator()                  - full-width rule (the player's)
+---     Chat.divider()                    - full-width '-' rule
 ---     Chat.header(title)                - separator + title + separator
 ---     Chat.section(name)                - section heading "[Section] NAME"
 ---     Chat.info(message)                - cyan info line
@@ -29,12 +33,11 @@ local Chat = {}
 
 local CHANNEL  = 121          -- FFXI system message channel
 local TAG      = 'PorterPacker'
-local SEP_CHAR = '='
 local DIV_CHAR = '-'
-local SEP_LEN  = 74
-
-local SEP = string.rep(SEP_CHAR, SEP_LEN)
-local DIV = string.rep(DIV_CHAR, SEP_LEN)
+-- GearSwap's standard (shared/utils/messages/chat_separators.lua DEFAULT_WIDTH)
+local STANDARD = {on = true, char = '=', width = 69, color = nil}
+-- the GearSwap file is read again after this many seconds (//gs c ui chatwidth rewrites it)
+local STYLE_TTL = 10
 
 -- Inline FFXI color codes (string.char(0x1F, color_id))
 local C = {
@@ -76,14 +79,47 @@ end
 ---   PANEL ELEMENTS
 ---  ═══════════════════════════════════════════════════════════════════════════
 
---- Display a colored separator line (74 '=' chars in gray).
-function Chat.separator()
-    windower.add_to_chat(CHANNEL, C.gray .. SEP)
+local style_cache = {name = nil, at = nil, style = STANDARD}
+
+--- The character's separator options from its GearSwap UI_CONFIG.lua, else GearSwap's standard. A file that does not
+--- load, or a value out of range, keeps the standard for that option.
+--- @return table {on, char, width, color}
+local function style()
+    local me = windower.ffxi.get_player()
+    local name = me and me.name
+    if not name then return STANDARD end
+    if style_cache.name == name and style_cache.at and os.clock() - style_cache.at < STYLE_TTL then return style_cache.style end
+    local path = windower.addon_path .. '../GearSwap/data/' .. name .. '/_common/display/UI_CONFIG.lua'
+    -- (addon_path ends with a slash: debug.lua's addon_path .. 'debug.log'; the same '../' as GearSwap's atelier_export.lua)
+    local ok, cfg = pcall(dofile, path)
+    local chat = ok and type(cfg) == 'table' and type(cfg.chat) == 'table' and cfg.chat or {}
+    local s = {on = chat.separators ~= false, char = STANDARD.char, width = STANDARD.width, color = nil}
+    if type(chat.separator_char) == 'string' and #chat.separator_char > 0 then s.char = chat.separator_char end
+    local width = tonumber(chat.width)
+    if width and width >= 20 and width <= 150 then s.width = math.floor(width) end
+    local color = tonumber(chat.separator_color)
+    if color and color >= 1 and color <= 255 then s.color = string.char(0x1F, math.floor(color)) end
+    style_cache = {name = name, at = os.clock(), style = s}
+    return s
 end
 
---- Mid-section divider (74 '-' chars in gray).
+--- `char` repeated to `n` characters (a multi-character choice is cut).
+local function rule(char, n)
+    return string.rep(char, math.ceil(n / #char)):sub(1, n)
+end
+
+--- Display a separator line: the player's character, width and color (none when separators are off).
+function Chat.separator()
+    local s = style()
+    if not s.on then return end
+    windower.add_to_chat(CHANNEL, (s.color or C.gray) .. rule(s.char, s.width))
+end
+
+--- Mid-section divider: '-' at the player's width and color (none when separators are off).
 function Chat.divider()
-    windower.add_to_chat(CHANNEL, C.gray .. DIV)
+    local s = style()
+    if not s.on then return end
+    windower.add_to_chat(CHANNEL, (s.color or C.gray) .. rule(DIV_CHAR, s.width))
 end
 
 --- Header panel: separator + yellow title + separator.
