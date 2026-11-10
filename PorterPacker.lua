@@ -964,6 +964,44 @@ end
 --- when the pack/unpack run it came with has finished. Nil without one.
 local after_run = nil
 
+-- Seconds a run that moves items waits after a job or sub job change. GearSwap's
+-- load of the new job takes ~8 s (macro book, equip, lockstyle at +8.2 s); twice
+-- the game crashed when //po ran inside that window (2026-10-16, 2026-11-10).
+local JOB_SETTLE = 10
+
+--- Wait, the addon already claimed, until JOB_SETTLE seconds have passed since
+--- the last job change. False when the run must not go on: a reset or zone
+--- change took the addon over, or the job changed again during the wait (the
+--- run was asked for the job the player had when typing it).
+--- @param token number the run's ownership token
+--- @return boolean
+local function wait_job_settled(token)
+    local changed_at = State.job_changed_at
+    if not changed_at then return true end
+    local left = JOB_SETTLE - (os.clock() - changed_at)
+    Debug.log(('run asked %.1fs after a job change'):format(os.clock() - changed_at))
+    if left <= 0 then return true end
+    Msg.notice(('Job just changed: waiting %d s for GearSwap to finish loading it.'):format(math.ceil(left)))
+    while os.clock() - changed_at < JOB_SETTLE do
+        coroutine.sleep(0.5)
+        if State.superseded(token) then return false end
+        if State.job_changed_at ~= changed_at then
+            Msg.warning('Job changed again during the wait - nothing done, type the command again.')
+            Debug.log('job changed again during the settle wait - run dropped')
+            return false
+        end
+    end
+    -- the player's state was checked when the command was typed, 10 s ago
+    local me = windower.ffxi.get_player()
+    if not me or me.status ~= 0 or State.packet_state ~= 0 then
+        Msg.warning('No longer idle after the wait - nothing done, type the command again.')
+        Debug.log('not idle after the settle wait - run dropped')
+        return false
+    end
+    Debug.log('settle wait over')
+    return true
+end
+
 local function run_exclusive(action, strip_gear)
     -- Taken here, before anything can fail: a `then` typed with a command that
     -- is refused must not be left behind for the next run to fire.
@@ -973,6 +1011,13 @@ local function run_exclusive(action, strip_gear)
     local token = State.begin_operation()
     if not token then
         Msg.already_running()
+        return
+    end
+
+    -- before anything moves: undressing is already gear changes. A `then` command
+    -- is dropped with the run, like for any run that did not reach its end.
+    if strip_gear and not wait_job_settled(token) then
+        State.end_operation(token)
         return
     end
 
@@ -1031,6 +1076,13 @@ windower.register_event('logout', function()
     State.reset_all()
 end)
 
+-- Remembered so a run asked right after a job change waits for GearSwap to finish
+-- loading the new job (wait_job_settled).
+windower.register_event('job change', 'sub job change', function()
+    State.job_changed_at = os.clock()
+    Debug.log('job change seen')
+end)
+
 windower.register_event(
     'addon command',
     function(...)
@@ -1042,6 +1094,20 @@ windower.register_event(
         -- Re-read per-character config so ignore_bags / slip_home_bag etc. are
         -- always current (cheap: just reads one optional file at <char>/config.lua).
         Config.refresh()
+        -- `debug = true` in this character's config.lua: the log is on without
+        -- //po debug on, appended to (not cleared) so a crash keeps the runs
+        -- before it. Once per load, so //po debug off still works.
+        if Config.debug and not State.debug_from_config then
+            State.debug_from_config = true
+            if not State.debug_enabled then
+                Debug.rotate(2 * 1024 * 1024)
+                State.debug_enabled = true
+                Debug.log(('===== Debug on from config.lua - %s (%s%s) ====='):format(
+                    player.name,
+                    player.main_job or '?',
+                    player.sub_job and ('/' .. player.sub_job) or ''))
+            end
+        end
         -- Drop the load_file cache so per-char config changes (and edits to
         -- data files between commands) always take effect. Within a single
         -- command, the cache survives across the multiple load_file calls a

@@ -77,4 +77,21 @@ function M.clear()
     if f then f:close() end
 end
 
+--- Keep a log that is switched on at every login (config.lua `debug = true`)
+--- from growing without end: past `max_bytes` it becomes debug_<name>.prev.log,
+--- replacing the previous one, and a new log starts. The last run before a
+--- crash is never lost this way, since it is the file being written.
+--- @param max_bytes number
+function M.rotate(max_bytes)
+    local path = M.path()
+    local f = io.open(path, 'r')
+    if not f then return end
+    local size = f:seek('end') or 0
+    f:close()
+    if size <= max_bytes then return end
+    local prev = path:gsub('%.log$', '.prev.log')
+    os.remove(prev)
+    os.rename(path, prev)
+end
+
 return M

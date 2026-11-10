@@ -97,6 +97,18 @@ M.trade_messages  = {}
 -- Debug toggle (read by debug.lua, written by command handler)
 -- ---------------------------------------------------------------------------
 M.debug_enabled = false
+-- Set once `debug = true` in the character's config.lua has switched the log on,
+-- so a `//po debug off` typed afterwards stays off until the addon reloads.
+M.debug_from_config = false
+
+-- ---------------------------------------------------------------------------
+-- Job change settle
+-- ---------------------------------------------------------------------------
+-- os.clock() of the last job or sub job change seen, nil before the first one.
+-- Twice (2026-10-16, 2026-11-10) the game crashed when //po started a few seconds
+-- after a job change, while GearSwap was still loading the new job (macro book,
+-- equip, lockstyle). A run that moves items waits until that load is over.
+M.job_changed_at = nil
 
 -- ---------------------------------------------------------------------------
 -- Reset helpers

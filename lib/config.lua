@@ -57,6 +57,7 @@ function M.refresh()
     for _, b in ipairs(DEFAULT_SLIP_BAGS) do table.insert(M.slip_bags, b) end
     M.ignore_bags = {}
     M.SLIP_HOME_BAG = 5  -- default fallback
+    M.debug = false
 
     local p = windower.ffxi.get_player()
     if not p or not p.name then return end
@@ -89,6 +90,10 @@ function M.refresh()
     if type(cfg.slip_home_bag) == 'number' then
         M.SLIP_HOME_BAG = cfg.slip_home_bag
     end
+
+    -- `debug = true`: the debug log is on from this character's first command,
+    -- without typing //po debug on after every login
+    M.debug = cfg.debug == true
 end
 
 -- Job lists are derived from physical folders:
